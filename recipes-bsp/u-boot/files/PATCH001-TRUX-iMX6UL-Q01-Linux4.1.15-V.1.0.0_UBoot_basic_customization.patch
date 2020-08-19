@@ -1,0 +1,3762 @@
+diff -Naur A/arch/arm/cpu/armv7/mx6/active_tamper.c B/arch/arm/cpu/armv7/mx6/active_tamper.c
+--- A/arch/arm/cpu/armv7/mx6/active_tamper.c	1970-01-01 05:30:00.000000000 +0530
++++ B/arch/arm/cpu/armv7/mx6/active_tamper.c	2017-06-09 11:08:40.067199197 +0530
+@@ -0,0 +1,206 @@
++#include <common.h>
++#include <asm/io.h>
++#include <asm/system.h>
++#include <asm/arch/snvs.h>
++
++
++static void configure_dryice_ext_tamper(unsigned int tx, unsigned int rx)
++{
++	int val;
++	int reg = DRY_TPCTRL0_OFFSET + rx * 4;
++
++	val = (0x0<<28) |
++          (0x1<<27) |
++          (0x0<<21) |
++          (0x1<<20) | // use extended sample period
++          ((tx - 4)<<17) | // active tamper N
++          (0x0<<16) |
++          (0x1<<15) | // pull always asserts the tamper pin
++          (0x1<<14) |
++          (0x1<<13) |
++#ifdef MX6UL_TO_1_1
++          (0x1<<11) | // Let the tamper pin work as tamper pin, for mx6ul chip >= TO1.1
++#endif
++          (0x0<<10) |
++          (0x1<<7) |
++          (0x1<<6) |
++          (0x1<<4) |  // tamper pin sample frequency is once every 32 cycles
++          (0x3<<2) |  // tamper pin sampling 4 cycles
++          (0x0<<0);
++
++	writel(val, reg);
++}
++
++static void stop_dryice_ext_tamper(unsigned int tx, unsigned int rx)
++{
++	int val;
++	int reg = DRY_TPCTRL0_OFFSET + rx * 4;
++
++	val = (0x0<<28) |
++		  (0x1<<27) |
++          (0x0<<21) |
++          (0x1<<20) | // use extended sample period
++          ((tx - 4)<<17) | // active tamper N
++          (0x0<<16) |
++          (0x1<<15) | // pull always asserts the tamper pin
++          (0x1<<14) |
++          (0x1<<13) |
++          (0x0<<10) |
++          (0x1<<7) |
++          (0x1<<6) |
++          (0x1<<4) |  // tamper pin sample frequency is once every 32 cycles
++          (0x3<<2) |  // tamper pin sampling 4 cycles
++          (0x0<<0),
++	writel(val, reg);
++
++	val = (0x0<<28) |
++          (0x0<<27) | // use 32kHz as IGWCS
++          (0x0<<21) |
++          (0x1<<20) | // use extended sample period
++          ((tx - 4)<<17) | // active tamper N
++          (0x0<<16) |
++          (0x1<<15) | // pull always asserts the tamper pin
++          (0x0<<14) | // disable tamper pin
++          (0x1<<13) |
++          (0x0<<10) |
++          (0x1<<7) |
++          (0x0<<6) |  // use 32kHz as TSCS
++          (0x1<<4) |  // tamper pin sample frequency is once every 32 cycles
++          (0x0<<2) |  // disabled tamper pin sampling
++          (0x0<<0),
++	writel(val, reg);
++
++}
++
++void active_tamper_test(unsigned int tx, unsigned int rx)
++{
++	int val, tamper_pin;
++	printf("start active tamper test on %d -> %d\n", tx, rx);
++
++	/*********************************************
++	 *   Configuring shadow registers to enable tamper pin  *
++	 *********************************************/
++	val = readl(OCOTP_LOCK) & 0x3;
++	tamper_pin = (readl(OCOTP_CFG2) & 0x300000) >> 20;
++	if((tamper_pin != 0) && val) {
++		printf("tamper fuse is programmed, tamper shadow register is locked, can't verify tamper function\n");
++		return;
++	}
++	if((tamper_pin != 0) && (val == 0)){
++		printf("set OCOTP_CFG2 shadow register to enable tamper detect mode\n");
++		val = readl(OCOTP_CFG2);
++		val &= ~0x300000;
++		writel(val, OCOTP_CFG2);
++	}
++
++	/****************************
++	 *   Configuring CAAM and SNVS  *
++	 ****************************/
++
++	/* Initialize power glitch detector register */
++	val = 0x41736166;
++	writel(val, SNVS_LPPGDR);
++
++	/* W1C PGD */
++	val = readl(SNVS_LPSR) & 0x00000008;
++	writel(val, SNVS_LPSR);
++
++	/* Programming ZMK via SW */
++	writel(0x11110000, SNVS_LPZMKR0);
++	writel(0x22220000, SNVS_LPZMKR1);
++	writel(0x33330000, SNVS_LPZMKR2);
++	writel(0x44440000, SNVS_LPZMKR3);
++	writel(0x55550000, SNVS_LPZMKR4);
++	writel(0x66660000, SNVS_LPZMKR5);
++	writel(0x77770000, SNVS_LPZMKR6);
++	writel(0x88880000, SNVS_LPZMKR7);
++
++	val = readl(SNVS_LPMKCR) | 0xa;
++	writel(val, SNVS_LPMKCR);
++	val = readl(SNVS_HPCOMR) | 0x1000;
++	writel(val, SNVS_HPCOMR);
++
++	val = readl(SNVS_LPMKCR) | 0x10;
++	writel(val, SNVS_LPMKCR);
++
++	val = readl(SNVS_HPSVSR);
++
++	/* LP Security Violation is a non-fatal Violation */
++	val = 0x40000000;
++	writel(val, SNVS_HPSVCR);
++
++	/* Enable SRTC invalidation in case of security violation */
++	val = readl(SNVS_LPCR);
++	val |= 0x11;
++	writel(val, SNVS_LPCR);
++
++
++	/*********************************
++	 *   Configuring active tamper tx output  *
++	 *********************************/
++
++	/* Configure LFSR polynomial and seed for active tamper tx */
++	val = AT5_POLYSEED;
++	writel(val, SNVS_LPAT1CR + (tx - 5) * 4);
++
++	/* Enable active tamper tx external pad */
++	val = readl(SNVS_LPATCTLR) | (1 << (tx - 5 + 16));
++	writel(val, SNVS_LPATCTLR);
++
++	/* Enable active tamper tx clk 16hz */
++	val = readl(SNVS_LPATCLKR);
++	val &= ~(3 << (tx - 5) * 4);
++	writel(val, SNVS_LPATCLKR);
++
++	/* Enable active tamper tx LFSR */
++	val = readl(SNVS_LPATCTLR) | (1 << (tx - 5));
++	writel(val, SNVS_LPATCTLR);
++
++	/* Enable glitch filter for external tamper rx */
++	if (rx < 2) {
++		val = readl(SNVS_LPTGFCR);
++		if (rx == 0)
++			val |= 0x800000;
++		else if (rx == 1)
++			val |= 0x80000000;
++		writel(val, SNVS_LPTGFCR);
++	} else if (rx < 6){
++		val = readl(SNVS_LPTGF1CR);
++		val |= 1 << ((rx - 1) * 8 - 1);
++		writel(val, SNVS_LPTGF1CR);
++	} else {
++		val = readl(SNVS_LPTGF2CR);
++		val |= 1 << ((rx - 5) * 8 - 1);
++		writel(val, SNVS_LPTGF2CR);
++	}
++
++	/* Route active tamper tx to external tamper rx */
++	if (rx < 8) {
++		val = readl(SNVS_LPATRC1R);
++		val &= ~(0xf << (rx * 4));
++		val |= ((tx - 4) << (rx * 4));
++		writel(val, SNVS_LPATRC1R);
++	} else {
++		val = readl(SNVS_LPATRC2R);
++		val &= ~(0xf << ((rx - 8) * 4));
++		val |= ((tx - 4) << ((rx - 8) * 4));
++		writel(val, SNVS_LPATRC2R);
++	}
++
++
++	/* Enable external tamper rx */
++	if (rx < 2) {
++		val = readl(SNVS_LPTDCR);
++		if (rx == 0)
++			val |= 0x200;
++		else if (rx == 1)
++			val |= 0x400;
++		writel(val, SNVS_LPTDCR);
++	} else {
++		val = readl(SNVS_LPTDC2R);
++		val |= 1 << (rx - 2);
++		writel(val, SNVS_LPTDC2R);
++	}
++
++	configure_dryice_ext_tamper(tx, rx);
++}
+diff -Naur A/arch/arm/cpu/armv7/mx6/dryice_tamper.c B/arch/arm/cpu/armv7/mx6/dryice_tamper.c
+--- A/arch/arm/cpu/armv7/mx6/dryice_tamper.c	1970-01-01 05:30:00.000000000 +0530
++++ B/arch/arm/cpu/armv7/mx6/dryice_tamper.c	2017-06-09 11:08:40.067199197 +0530
+@@ -0,0 +1,129 @@
++#include <common.h>
++#include <asm/io.h>
++#include <asm/system.h>
++#include <asm/arch/snvs.h>
++
++
++extern void active_tamper_test(unsigned int tx, unsigned int rx);
++extern void passive_tamper_test(unsigned int rx);
++
++static void get_tamper_status(void)
++{
++	unsigned int lpsr, lptdsr, hpsr, ssm;
++
++	lpsr = readl(SNVS_LPSR);
++	lptdsr = readl(SNVS_LPTDSR);
++	hpsr = readl(SNVS_HPSR);
++	ssm = (hpsr & 0xf00) >> 8;
++
++	if (lpsr & (1 << 9))
++		printf("External Tampering 1 Detected\n");
++	if (lpsr & (1 << 10))
++		printf("External Tampering 2 Detected\n");
++	if (lptdsr & (1 << 0))
++		printf("External Tampering 3 Detected\n");
++	if (lptdsr & (1 << 1))
++		printf("External Tampering 4 Detected\n");
++	if (lptdsr & (1 << 2))
++		printf("External Tampering 5 Detected\n");
++	if (lptdsr & (1 << 3))
++		printf("External Tampering 6 Detected\n");
++	if (lptdsr & (1 << 4))
++		printf("External Tampering 7 Detected\n");
++	if (lptdsr & (1 << 5))
++		printf("External Tampering 8 Detected\n");
++	if (lptdsr & (1 << 6))
++		printf("External Tampering 9 Detected\n");
++	if (lptdsr & (1 << 7))
++		printf("External Tampering 10 Detected\n");
++	if (!(lpsr & (3 << 9)) && !(lptdsr & 0xff))
++		printf("No External Tampering Detected\n");
++
++	if (hpsr & 0x80000000)
++		printf("Zeroizable Master Key is clear\n");
++	else
++		printf("Zeroizable Master Key is not zero\n");
++
++	if (ssm == 0)
++		printf("System Security Monitor State: Init\n");
++	else if (ssm == 0x8)
++		printf("System Security Monitor State: Init Intermediate\n");
++	else if (ssm == 0x9)
++		printf("System Security Monitor State: Check\n");
++	else if (ssm == 0xb)
++		printf("System Security Monitor State: Non-Secure\n");
++	else if (ssm == 0xd)
++		printf("System Security Monitor State: Trusted\n");
++	else if (ssm == 0xf)
++		printf("System Security Monitor State: Secure\n");
++	else if (ssm == 0x3)
++		printf("System Security Monitor State: Soft Fail\n");
++	else if (ssm == 0x1)
++		printf("System Security Monitor State: Hard Fail\n");
++	else
++		printf("System Security Monitor State: 0x%x\n", ssm);
++}
++
++static void clear_tamper_warning(void)
++{
++	unsigned int lpsr, lptdsr;
++
++	lpsr = readl(SNVS_LPSR);
++	lptdsr = readl(SNVS_LPTDSR);
++
++	writel(lpsr, SNVS_LPSR);
++	writel(lptdsr, SNVS_LPTDSR);
++}
++
++static int do_tamper_test(cmd_tbl_t *cmdtp, int flag, int argc, char *const argv[])
++{
++	const char *op = argc >= 2 ? argv[1] : NULL;
++	unsigned int tx, rx;
++
++	if (argc < 2)
++		return CMD_RET_USAGE;
++
++	if (!strcmp(op, "active")) {
++		if (argc < 4)
++			return CMD_RET_USAGE;
++
++		tx = simple_strtoul(argv[2], NULL, 16);
++		rx = simple_strtoul(argv[3], NULL, 16);
++		//if ((tx > 9) || (tx < 5))
++		//	return CMD_RET_USAGE;
++		if ((tx > 9))
++			return CMD_RET_USAGE;
++		if ((rx > 9) || (rx == tx))
++			return CMD_RET_USAGE;
++
++		active_tamper_test(tx, rx);
++
++	} else if (!strcmp(op, "passive")) {
++		if (argc < 3)
++		return CMD_RET_USAGE;
++
++		rx = simple_strtoul(argv[2], NULL, 16);
++		if (rx > 9)
++			return CMD_RET_USAGE;
++
++		passive_tamper_test(rx);
++
++	} else if (!strcmp(op, "status")) {
++		get_tamper_status();
++	} else if (!strcmp(op, "clear")) {
++		clear_tamper_warning();
++	}
++
++	return 0;
++}
++
++
++U_BOOT_CMD(
++		tamper, CONFIG_SYS_MAXARGS, 0, do_tamper_test,
++		"mx6ul tamper test",
++		"active <tx rx>  - tx is active tamper pin from 9 ~ 5, \n"
++		"    rx pin is from 9 ~ 0 and should not equal to tx pin\n"
++		"passive <rx> ... - rx is passive tamper pin from 9 ~ 0\n"
++		"status - Get tamper status\n"
++		"clear - clear tamper warning\n"
++	  );
+diff -Naur A/arch/arm/cpu/armv7/mx6/Kconfig B/arch/arm/cpu/armv7/mx6/Kconfig
+--- A/arch/arm/cpu/armv7/mx6/Kconfig	2017-04-04 12:40:21.000000000 +0530
++++ B/arch/arm/cpu/armv7/mx6/Kconfig	2017-06-09 11:08:40.067199197 +0530
+@@ -137,6 +137,20 @@
+ 	select DM
+ 	select DM_THERMAL
+ 
++config TARGET_MX6_TRUXQ01_SOM
++	bool "imx6_truxq01_som"
++	select MX6UL
++	select MX6ULL
++	select DM
++	select DM_THERMAL
++
++config TARGET_MX6_TRUXQ01_SOM_MFG
++	bool "imx6_truxq01_som"
++	select MX6UL
++	select MX6ULL
++	select DM
++	select DM_THERMAL
++
+ config TARGET_MX6SX_17X17_ARM2
+ 	bool "mx6sx_17x17_arm2"
+ 	select MX6SX
+@@ -188,6 +202,7 @@
+ 	select DM
+ 	select DM_THERMAL
+ 
++
+ config TARGET_SECOMX6
+ 	bool "secomx6 boards"
+ 
+@@ -235,6 +250,7 @@
+ source "board/freescale/mx6sx_19x19_arm2/Kconfig"
+ source "board/freescale/mx6ul_14x14_ddr3_arm2/Kconfig"
+ source "board/freescale/mx6ul_14x14_lpddr2_arm2/Kconfig"
++source "board/freescale/imx6_truxq01_som/Kconfig"
+ source "board/freescale/mx6ull_ddr3_arm2/Kconfig"
+ source "board/freescale/mx6ullevk/Kconfig"
+ source "board/gateworks/gw_ventana/Kconfig"
+diff -Naur A/arch/arm/cpu/armv7/mx6/Makefile B/arch/arm/cpu/armv7/mx6/Makefile
+--- A/arch/arm/cpu/armv7/mx6/Makefile	2017-04-04 12:40:21.000000000 +0530
++++ B/arch/arm/cpu/armv7/mx6/Makefile	2017-06-09 11:08:40.067199197 +0530
+@@ -12,5 +12,6 @@
+ obj-$(CONFIG_MP)             += mp.o
+ ifdef CONFIG_MX6UL
+ obj-$(CONFIG_CMD_BEE)        += bee.o
++obj-$(CONFIG_CMD_TAMPER)     += dryice_tamper.o active_tamper.o passive_tamper.o
+ endif
+ obj-$(CONFIG_MODULE_FUSE)        += module_fuse.o
+diff -Naur A/arch/arm/cpu/armv7/mx6/passive_tamper.c B/arch/arm/cpu/armv7/mx6/passive_tamper.c
+--- A/arch/arm/cpu/armv7/mx6/passive_tamper.c	1970-01-01 05:30:00.000000000 +0530
++++ B/arch/arm/cpu/armv7/mx6/passive_tamper.c	2017-06-09 11:08:40.067199197 +0530
+@@ -0,0 +1,199 @@
++#include <common.h>
++#include <asm/io.h>
++#include <asm/system.h>
++#include <asm/arch/snvs.h>
++
++#define TAMPER_HIGH
++
++void stop_dryice_ext_tamper(unsigned int rx)
++{
++	int val;
++	int reg = DRY_TPCTRL0_OFFSET + rx * 4;
++
++	val = (0x0<<28) |
++          (0x1<<27) |
++          (0x0<<21) |
++          (0x1<<20) | // use extended sample period
++          (0x0<<17) | // Passive Input
++#ifdef TAMPER_HIGH // when tamper pin connected to VDD, tamper detected.
++          (0x0<<16) | // expected tamper asserted level is high
++#else
++          (0x1<<16) | // expected tamper asserted level is low
++#endif
++          (0x1<<15) |
++          (0x1<<14) |
++          (0x1<<13) |
++          (0x0<<10) |
++          (0x1<<7) |
++          (0x1<<6) |
++          (0x1<<4) |  // sample once for every 32 cycles
++          (0x0<<2) |  // disable tamper pin sampling, sample width is 4
++          (0x0<<0),
++	writel(val, reg);
++
++	val = (0x0<<28) |
++          (0x0<<27) | // use 32kHz as IGWCS
++          (0x0<<21) |
++          (0x1<<20) |
++          (0x0<<17) |
++#ifdef TAMPER_HIGH // when tamper pin connected to VDD, tamper detected.
++          (0x0<<16) | // expected tamper asserted level is high
++#else
++          (0x1<<16) | // expected tamper asserted level is low
++#endif
++          (0x1<<15) |
++          (0x0<<14) | // disable tamper pin
++          (0x1<<13) |
++          (0x0<<10) |
++          (0x1<<7) |
++          (0x0<<6) |  // use 32kHz as TSCS
++          (0x0<<4) |
++          (0x0<<2) |  // disabled tamper pin sampling
++          (0x0<<0),
++	writel(val, reg);
++}
++
++void configure_dryice_ext_tamper(unsigned int rx)
++{
++	int val;
++	int reg = DRY_TPCTRL0_OFFSET + rx * 4;
++
++	val = (0x0<<28) |
++          (0x1<<27) |
++          (0x0<<21) |
++          (0x1<<20) | // use extended sample period
++          (0x0<<17) | // Passive Input
++#ifdef TAMPER_HIGH // when tamper pin connected to VDD, tamper detected.
++          (0x0<<16) | // expected tamper asserted level is high
++#else
++          (0x1<<16) | // expected tamper asserted level is low
++#endif
++          (0x1<<15) |
++          (0x1<<14) |
++          (0x1<<13) |
++#ifdef MX6UL_TO_1_1
++          (0x1<<11) |  // Let the tamper pin work as tamper pin, for mx6ul chip >= TO1.1
++#endif
++          (0x0<<10) |
++          (0x1<<7) |
++          (0x1<<6) |
++          (0x1<<4) |  // sample once for every 32 cycles
++          (0x3<<2) |  // enable tamper pin sampling, sample width is 4
++          (0x0<<0),
++
++	writel(val, reg);
++}
++
++void passive_tamper_test(unsigned int rx)
++{
++	int val, tamper_pin;
++	printf("start passive tamper test on pin %d\n", rx);
++
++	/*********************************************
++	 *   Configuring shadow registers to enable tamper pin  *
++	 *********************************************/
++	val = readl(OCOTP_LOCK) & 0x3;
++	tamper_pin = (readl(OCOTP_CFG2) & 0x300000) >> 20;
++	if((tamper_pin != 0) && val) {
++		printf("tamper fuse is programmed, tamper shadow register is locked, can't verify tamper function\n");
++		return;
++	}
++	if((tamper_pin != 0) && (val == 0)){
++		printf("set OCOTP_CFG2 shadow register to enable tamper detect mode\n");
++		val = readl(OCOTP_CFG2);
++		val &= ~0x300000;
++		writel(val, OCOTP_CFG2);
++	}
++
++	/****************************
++	 *   Configuring CAAM and SNVS  *
++	 ****************************/
++
++	/* Initialize power glitch detector register */
++	val = 0x41736166;
++	writel(val, SNVS_LPPGDR);
++
++	/* W1C PGD */
++	val = readl(SNVS_LPSR) & 0x00000008;
++	writel(val, SNVS_LPSR);
++
++	/* Programming ZMK via SW */
++	writel(0x11111111, SNVS_LPZMKR0);
++	writel(0x22222222, SNVS_LPZMKR1);
++	writel(0x33333333, SNVS_LPZMKR2);
++	writel(0x44444444, SNVS_LPZMKR3);
++	writel(0x55555555, SNVS_LPZMKR4);
++	writel(0x66666666, SNVS_LPZMKR5);
++	writel(0x77777777, SNVS_LPZMKR6);
++	writel(0x88888888, SNVS_LPZMKR7);
++
++	val = readl(SNVS_LPMKCR) | 0xa;
++	writel(val, SNVS_LPMKCR);
++	val = readl(SNVS_HPCOMR) | 0x1000;
++	writel(val, SNVS_HPCOMR);
++
++	val = readl(SNVS_LPMKCR) | 0x10;
++	writel(val, SNVS_LPMKCR);
++
++	/* LP Security Violation is a non-fatal Violation */
++	val = 0x40000000;
++	writel(val, SNVS_HPSVCR);
++
++	/* Enable SRTC invalidation in case of security violation */
++	val = readl(SNVS_LPCR);
++	val |= 0x11;
++	writel(val, SNVS_LPCR);
++
++	/*********************************
++	 *   Configuring passive tamper rx          *
++	 *********************************/
++
++	/* Enable glitch filter for external tamper rx */
++	if (rx < 2) {
++		val = readl(SNVS_LPTGFCR);
++		if (rx == 0)
++			val |= 0x800000;
++		else if (rx == 1)
++			val |= 0x80000000;
++		writel(val, SNVS_LPTGFCR);
++	} else if (rx < 6){
++		val = readl(SNVS_LPTGF1CR);
++		val |= 1 << ((rx - 1) * 8 - 1);
++		writel(val, SNVS_LPTGF1CR);
++	} else {
++		val = readl(SNVS_LPTGF2CR);
++		val |= 1 << ((rx - 5) * 8 - 1);
++		writel(val, SNVS_LPTGF2CR);
++	}
++
++#ifdef TAMPER_HIGH
++	/* Set external tampering rx polarity to high and enable tamper */
++	if (rx < 2) {
++		val = readl(SNVS_LPTDCR);
++		if (rx == 0)
++			val |= 0x800;
++		else if (rx == 1)
++			val |= 0x1000;
++		writel(val, SNVS_LPTDCR);
++	} else {
++		val = readl(SNVS_LPTDC2R);
++		val |= 1 << (rx - 2 + 16);
++		writel(val, SNVS_LPTDC2R);
++	}
++#endif
++	/* Enable external tamper rx */
++	if (rx < 2) {
++		val = readl(SNVS_LPTDCR);
++		if (rx == 0)
++			val |= 0x200;
++		else if (rx == 1)
++			val |= 0x400;
++		writel(val, SNVS_LPTDCR);
++	} else {
++		val = readl(SNVS_LPTDC2R);
++		val |= 1 << (rx - 2);
++		writel(val, SNVS_LPTDC2R);
++	}
++
++	configure_dryice_ext_tamper(rx);
++}
+diff -Naur A/arch/arm/include/asm/arch-mx6/mx6-pins.h B/arch/arm/include/asm/arch-mx6/mx6-pins.h
+--- A/arch/arm/include/asm/arch-mx6/mx6-pins.h	2017-04-04 12:40:21.000000000 +0530
++++ B/arch/arm/include/asm/arch-mx6/mx6-pins.h	2017-06-09 11:08:40.067199197 +0530
+@@ -12,6 +12,10 @@
+ #define MX6_PAD_DECLARE(prefix, name, pco, mc, mm, sio, si, pc) \
+ 	prefix##name = IOMUX_PAD(pco, mc, mm, sio, si, pc)
+ 
++#ifdef CONFIG_MX6_TRUXQ01
++#include "imx6_pins_truxq01.h"
++#endif
++#ifndef CONFIG_MX6_TRUXQ01
+ #ifdef CONFIG_MX6QDL
+ enum {
+ #define MX6_PAD_DECL(name, pco, mc, mm, sio, si, pc) \
+@@ -45,5 +49,6 @@
+ #else
+ #error "Please select cpu"
+ #endif	/* CONFIG_MX6Q */
++#endif
+ 
+ #endif	/*__ASM_ARCH_MX6_PINS_H__ */
+diff -Naur A/arch/arm/include/asm/arch-mx6/imx6_pins_truxq01.h B/arch/arm/include/asm/arch-mx6/imx6_pins_truxq01.h
+--- A/arch/arm/include/asm/arch-mx6/imx6_pins_truxq01.h	1970-01-01 05:30:00.000000000 +0530
++++ B/arch/arm/include/asm/arch-mx6/imx6_pins_truxq01.h	2017-06-09 11:08:40.067199197 +0530
+@@ -0,0 +1,1138 @@
++/*
++ * Copyright (c), 2019 Trunexa Infoways Pvt. Ltd.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2
++ * as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA02111-1307USA
++ */
++/*
++ * @file imx6_pins_truxq01.h
++ *
++ * @brief IOMUX Configuration for Ultralite and Ultralitelite SOMs
++ *
++ * @ingroup IOMUX
++ */
++
++
++#ifndef __ASM_ARCH_IMX6UL_PINS_H__
++#define __ASM_ARCH_IMX6UL_PINS_H__
++
++#include <asm/imx-common/iomux-v3.h>
++
++enum {
++	MX6ULL_PAD_BOOT_MODE0__GPIO5_IO10	                = IOMUX_PAD(0x0044, 0x0000, IOMUX_CONFIG_LPSR | 5, 0x0000, 0, 0),
++	MX6ULL_PAD_BOOT_MODE1__GPIO5_IO11	                = IOMUX_PAD(0x0048, 0x0004, IOMUX_CONFIG_LPSR | 5, 0x0000, 0, 0),
++
++	MX6_PAD_BOOT_MODE0__GPIO5_IO10	                        = IOMUX_PAD(0x02A0, 0x0014, 5, 0x0000, 0, 0),
++	MX6_PAD_BOOT_MODE1__GPIO5_IO11	                        = IOMUX_PAD(0x02A4, 0x0018, 5, 0x0000, 0, 0),
++	/*
++	 * The TAMPER Pin can be used for GPIO, which depends on
++	 * fusemap TAMPER_PIN_DISABLE[1:0] settings.
++	 */
++	MX6_PAD_SNVS_TAMPER0__GPIO5_IO00                       = IOMUX_PAD(0x02A8, 0x001C, 5, 0x0000, 0, 0),
++	MX6_PAD_SNVS_TAMPER1__GPIO5_IO01                       = IOMUX_PAD(0x02AC, 0x0020, 5, 0x0000, 0, 0),
++	MX6_PAD_SNVS_TAMPER2__GPIO5_IO02                       = IOMUX_PAD(0x02B0, 0x0024, 5, 0x0000, 0, 0),
++	MX6_PAD_SNVS_TAMPER3__GPIO5_IO03                       = IOMUX_PAD(0x02B4, 0x0028, 5, 0x0000, 0, 0),
++	MX6_PAD_SNVS_TAMPER4__GPIO5_IO04                       = IOMUX_PAD(0x02B8, 0x002C, 5, 0x0000, 0, 0),
++	MX6_PAD_SNVS_TAMPER5__GPIO5_IO05                       = IOMUX_PAD(0x02BC, 0x0030, 5, 0x0000, 0, 0),
++	MX6_PAD_SNVS_TAMPER6__GPIO5_IO06                       = IOMUX_PAD(0x02C0, 0x0034, 5, 0x0000, 0, 0),
++	MX6_PAD_SNVS_TAMPER7__GPIO5_IO07                       = IOMUX_PAD(0x02C4, 0x0038, 5, 0x0000, 0, 0),
++	MX6_PAD_SNVS_TAMPER8__GPIO5_IO08                       = IOMUX_PAD(0x02C8, 0x003C, 5, 0x0000, 0, 0),
++	MX6_PAD_SNVS_TAMPER9__GPIO5_IO09                       = IOMUX_PAD(0x02CC, 0x0040, 5, 0x0000, 0, 0),
++
++	MX6_PAD_JTAG_MOD__SJC_MOD                              = IOMUX_PAD(0x02D0, 0x0044, 0, 0x0000, 0, 0),
++	MX6_PAD_JTAG_MOD__GPT2_CLK                             = IOMUX_PAD(0x02D0, 0x0044, 1, 0x05A0, 0, 0),
++	MX6_PAD_JTAG_MOD__SPDIF_OUT                            = IOMUX_PAD(0x02D0, 0x0044, 2, 0x0000, 0, 0),
++	MX6_PAD_JTAG_MOD__ENET1_REF_CLK_25M                    = IOMUX_PAD(0x02D0, 0x0044, 3, 0x0000, 0, 0),
++	MX6_PAD_JTAG_MOD__CCM_PMIC_RDY                         = IOMUX_PAD(0x02D0, 0x0044, 4, 0x04C0, 0, 0),
++	MX6_PAD_JTAG_MOD__GPIO1_IO10                           = IOMUX_PAD(0x02D0, 0x0044, 5, 0x0000, 0, 0),
++	MX6_PAD_JTAG_MOD__SDMA_EXT_EVENT00                     = IOMUX_PAD(0x02D0, 0x0044, 6, 0x0610, 0, 0),
++
++	MX6_PAD_JTAG_TMS__SJC_TMS                              = IOMUX_PAD(0x02D4, 0x0048, 0, 0x0000, 0, 0),
++	MX6_PAD_JTAG_TMS__GPT2_CAPTURE1                        = IOMUX_PAD(0x02D4, 0x0048, 1, 0x0598, 0, 0),
++	MX6_PAD_JTAG_TMS__SAI2_MCLK                            = IOMUX_PAD(0x02D4, 0x0048, 2, 0x05F0, 0, 0),
++	MX6_PAD_JTAG_TMS__CCM_CLKO1                            = IOMUX_PAD(0x02D4, 0x0048, 3, 0x0000, 0, 0),
++	MX6_PAD_JTAG_TMS__CCM_WAIT                             = IOMUX_PAD(0x02D4, 0x0048, 4, 0x0000, 0, 0),
++	MX6_PAD_JTAG_TMS__GPIO1_IO11                           = IOMUX_PAD(0x02D4, 0x0048, 5, 0x0000, 0, 0),
++	MX6_PAD_JTAG_TMS__SDMA_EXT_EVENT01                     = IOMUX_PAD(0x02D4, 0x0048, 6, 0x0614, 0, 0),
++	MX6_PAD_JTAG_TMS__EPIT1_OUT                            = IOMUX_PAD(0x02D4, 0x0048, 8, 0x0000, 0, 0),
++
++	MX6_PAD_JTAG_TDO__SJC_TDO                              = IOMUX_PAD(0x02D8, 0x004C, 0, 0x0000, 0, 0),
++	MX6_PAD_JTAG_TDO__GPT2_CAPTURE2                        = IOMUX_PAD(0x02D8, 0x004C, 1, 0x059C, 0, 0),
++	MX6_PAD_JTAG_TDO__SAI2_TX_SYNC                         = IOMUX_PAD(0x02D8, 0x004C, 2, 0x05FC, 0, 0),
++	MX6_PAD_JTAG_TDO__CCM_CLKO2                            = IOMUX_PAD(0x02D8, 0x004C, 3, 0x0000, 0, 0),
++	MX6_PAD_JTAG_TDO__CCM_STOP                             = IOMUX_PAD(0x02D8, 0x004C, 4, 0x0000, 0, 0),
++	MX6_PAD_JTAG_TDO__GPIO1_IO12                           = IOMUX_PAD(0x02D8, 0x004C, 5, 0x0000, 0, 0),
++	MX6_PAD_JTAG_TDO__MQS_RIGHT                            = IOMUX_PAD(0x02D8, 0x004C, 6, 0x0000, 0, 0),
++	MX6_PAD_JTAG_TDO__EPIT2_OUT                            = IOMUX_PAD(0x02D8, 0x004C, 8, 0x0000, 0, 0),
++
++	MX6_PAD_JTAG_TDI__SJC_TDI                              = IOMUX_PAD(0x02DC, 0x0050, 0, 0x0000, 0, 0),
++	MX6_PAD_JTAG_TDI__GPT2_COMPARE1                        = IOMUX_PAD(0x02DC, 0x0050, 1, 0x0000, 0, 0),
++	MX6_PAD_JTAG_TDI__SAI2_TX_BCLK                         = IOMUX_PAD(0x02DC, 0x0050, 2, 0x05F8, 0, 0),
++	MX6_PAD_JTAG_TDI__PWM6_OUT                             = IOMUX_PAD(0x02DC, 0x0050, 4, 0x0000, 0, 0),
++	MX6_PAD_JTAG_TDI__GPIO1_IO13                           = IOMUX_PAD(0x02DC, 0x0050, 5, 0x0000, 0, 0),
++	MX6_PAD_JTAG_TDI__MQS_LEFT                             = IOMUX_PAD(0x02DC, 0x0050, 6, 0x0000, 0, 0),
++	MX6_PAD_JTAG_TDI__SIM1_POWER_FAIL                      = IOMUX_PAD(0x02DC, 0x0050, 8, 0x0000, 0, 0),
++
++	MX6_PAD_JTAG_TCK__SJC_TCK                              = IOMUX_PAD(0x02E0, 0x0054, 0, 0x0000, 0, 0),
++	MX6_PAD_JTAG_TCK__GPT2_COMPARE2                        = IOMUX_PAD(0x02E0, 0x0054, 1, 0x0000, 0, 0),
++	MX6_PAD_JTAG_TCK__SAI2_RX_DATA                         = IOMUX_PAD(0x02E0, 0x0054, 2, 0x05F4, 0, 0),
++	MX6_PAD_JTAG_TCK__PWM7_OUT                             = IOMUX_PAD(0x02E0, 0x0054, 4, 0x0000, 0, 0),
++	MX6_PAD_JTAG_TCK__GPIO1_IO14                           = IOMUX_PAD(0x02E0, 0x0054, 5, 0x0000, 0, 0),
++	MX6_PAD_JTAG_TCK__REF_CLK_32K                          = IOMUX_PAD(0x02E0, 0x0054, 6, 0x0000, 0, 0),
++	MX6_PAD_JTAG_TCK__SIM2_POWER_FAIL                      = IOMUX_PAD(0x02E0, 0x0054, 8, 0x0000, 0, 0),
++
++	MX6_PAD_JTAG_TRST_B__SJC_TRSTB                         = IOMUX_PAD(0x02E4, 0x0058, 0, 0x0000, 0, 0),
++	MX6_PAD_JTAG_TRST_B__GPT2_COMPARE3                     = IOMUX_PAD(0x02E4, 0x0058, 1, 0x0000, 0, 0),
++	MX6_PAD_JTAG_TRST_B__SAI2_TX_DATA                      = IOMUX_PAD(0x02E4, 0x0058, 2, 0x0000, 0, 0),
++	MX6_PAD_JTAG_TRST_B__PWM8_OUT                          = IOMUX_PAD(0x02E4, 0x0058, 4, 0x0000, 0, 0),
++	MX6_PAD_JTAG_TRST_B__GPIO1_IO15                        = IOMUX_PAD(0x02E4, 0x0058, 5, 0x0000, 0, 0),
++	MX6_PAD_JTAG_TRST_B__REF_CLK_24M                       = IOMUX_PAD(0x02E4, 0x0058, 6, 0x0000, 0, 0),
++	MX6_PAD_JTAG_TRST_B__CAAM_RNG_OSC_OBS                  = IOMUX_PAD(0x02E4, 0x0058, 8, 0x0000, 0, 0),
++
++	MX6_PAD_GPIO1_IO00__I2C2_SCL                           = IOMUX_PAD(0x02E8, 0x005C, IOMUX_CONFIG_SION | 0, 0x05AC, 1, 0),
++	MX6_PAD_GPIO1_IO00__GPT1_CAPTURE1                      = IOMUX_PAD(0x02E8, 0x005C, 1, 0x058C, 0, 0),
++	MX6_PAD_GPIO1_IO00__ANATOP_OTG1_ID                     = IOMUX_PAD(0x02E8, 0x005C, 2, 0x04B8, 0, 0),
++	MX6_PAD_GPIO1_IO00__ENET1_REF_CLK1                     = IOMUX_PAD(0x02E8, 0x005C, 3, 0x0574, 0, 0),
++	MX6_PAD_GPIO1_IO00__MQS_RIGHT                          = IOMUX_PAD(0x02E8, 0x005C, 4, 0x0000, 0, 0),
++	MX6_PAD_GPIO1_IO00__GPIO1_IO00                         = IOMUX_PAD(0x02E8, 0x005C, 5, 0x0000, 0, 0),
++	MX6_PAD_GPIO1_IO00__ENET1_1588_EVENT0_IN               = IOMUX_PAD(0x02E8, 0x005C, 6, 0x0000, 0, 0),
++	MX6_PAD_GPIO1_IO00__SRC_SYSTEM_RESET                   = IOMUX_PAD(0x02E8, 0x005C, 7, 0x0000, 0, 0),
++	MX6_PAD_GPIO1_IO00__WDOG3_WDOG_B                       = IOMUX_PAD(0x02E8, 0x005C, 8, 0x0000, 0, 0),
++
++	MX6_PAD_GPIO1_IO01__I2C2_SDA                           = IOMUX_PAD(0x02EC, 0x0060, IOMUX_CONFIG_SION | 0, 0x05B0, 1, 0),
++	MX6_PAD_GPIO1_IO01__GPT1_COMPARE1                      = IOMUX_PAD(0x02EC, 0x0060, 1, 0x0000, 0, 0),
++	MX6_PAD_GPIO1_IO01__USB_OTG1_OC                        = IOMUX_PAD(0x02EC, 0x0060, 2, 0x0664, 0, 0),
++	MX6_PAD_GPIO1_IO01__ENET2_REF_CLK2                     = IOMUX_PAD(0x02EC, 0x0060, 3, 0x057C, 0, 0),
++	MX6_PAD_GPIO1_IO01__MQS_LEFT                           = IOMUX_PAD(0x02EC, 0x0060, 4, 0x0000, 0, 0),
++	MX6_PAD_GPIO1_IO01__GPIO1_IO01                         = IOMUX_PAD(0x02EC, 0x0060, 5, 0x0000, 0, 0),
++	MX6_PAD_GPIO1_IO01__ENET1_1588_EVENT0_OUT              = IOMUX_PAD(0x02EC, 0x0060, 6, 0x0000, 0, 0),
++	MX6_PAD_GPIO1_IO01__SRC_EARLY_RESET                    = IOMUX_PAD(0x02EC, 0x0060, 7, 0x0000, 0, 0),
++	MX6_PAD_GPIO1_IO01__WDOG1_WDOG_B                       = IOMUX_PAD(0x02EC, 0x0060, 8, 0x0000, 0, 0),
++
++	MX6_PAD_GPIO1_IO02__I2C1_SCL                           = IOMUX_PAD(0x02F0, 0x0064, IOMUX_CONFIG_SION | 0, 0x05A4, 0, 0),
++	MX6_PAD_GPIO1_IO02__GPT1_COMPARE2                      = IOMUX_PAD(0x02F0, 0x0064, 1, 0x0000, 0, 0),
++	MX6_PAD_GPIO1_IO02__USB_OTG2_PWR                       = IOMUX_PAD(0x02F0, 0x0064, 2, 0x0000, 0, 0),
++	MX6_PAD_GPIO1_IO02__ENET1_REF_CLK_25M                  = IOMUX_PAD(0x02F0, 0x0064, 3, 0x0000, 0, 0),
++	MX6_PAD_GPIO1_IO02__USDHC1_WP                          = IOMUX_PAD(0x02F0, 0x0064, 4, 0x066C, 0, 0),
++	MX6_PAD_GPIO1_IO02__GPIO1_IO02                         = IOMUX_PAD(0x02F0, 0x0064, 5, 0x0000, 0, 0),
++	MX6_PAD_GPIO1_IO02__SDMA_EXT_EVENT00                   = IOMUX_PAD(0x02F0, 0x0064, 6, 0x0610, 1, 0),
++	MX6_PAD_GPIO1_IO02__SRC_ANY_PU_RESET                   = IOMUX_PAD(0x02F0, 0x0064, 7, 0x0000, 0, 0),
++	MX6_PAD_GPIO1_IO02__UART1_DCE_TX                       = IOMUX_PAD(0x02F0, 0x0064, 8, 0x0000, 0, 0),
++	MX6_PAD_GPIO1_IO02__UART1_DTE_RX                       = IOMUX_PAD(0x02F0, 0x0064, 8, 0x0624, 0, 0),
++
++	MX6_PAD_GPIO1_IO03__I2C1_SDA                           = IOMUX_PAD(0x02F4, 0x0068, IOMUX_CONFIG_SION | 0, 0x05A8, 1, 0),
++	MX6_PAD_GPIO1_IO03__GPT1_COMPARE3                      = IOMUX_PAD(0x02F4, 0x0068, 1, 0x0000, 0, 0),
++	MX6_PAD_GPIO1_IO03__USB_OTG2_OC                        = IOMUX_PAD(0x02F4, 0x0068, 2, 0x0660, 0, 0),
++	MX6_PAD_GPIO1_IO03__REF_CLK_32K                        = IOMUX_PAD(0x02F4, 0x0068, 3, 0x0000, 0, 0),
++	MX6_PAD_GPIO1_IO03__USDHC1_CD_B                        = IOMUX_PAD(0x02F4, 0x0068, 4, 0x0668, 0, 0),
++	MX6_PAD_GPIO1_IO03__GPIO1_IO03                         = IOMUX_PAD(0x02F4, 0x0068, 5, 0x0000, 0, 0),
++	MX6_PAD_GPIO1_IO03__CCM_DI0_EXT_CLK                    = IOMUX_PAD(0x02F4, 0x0068, 6, 0x0000, 0, 0),
++	MX6_PAD_GPIO1_IO03__SRC_TESTER_ACK                     = IOMUX_PAD(0x02F4, 0x0068, 7, 0x0000, 0, 0),
++	MX6_PAD_GPIO1_IO03__UART1_DCE_RX                       = IOMUX_PAD(0x02F4, 0x0068, 8, 0x0624, 1, 0),
++	MX6_PAD_GPIO1_IO03__UART1_DTE_TX                       = IOMUX_PAD(0x02F4, 0x0068, 8, 0x0000, 0, 0),
++
++	MX6_PAD_GPIO1_IO04__ENET1_REF_CLK1                     = IOMUX_PAD(0x02F8, 0x006C, 0, 0x0574, 1, 0),
++	MX6_PAD_GPIO1_IO04__PWM3_OUT                           = IOMUX_PAD(0x02F8, 0x006C, 1, 0x0000, 0, 0),
++	MX6_PAD_GPIO1_IO04__USB_OTG1_PWR                       = IOMUX_PAD(0x02F8, 0x006C, 2, 0x0000, 0, 0),
++	MX6_PAD_GPIO1_IO04__REF_CLK_24M                        = IOMUX_PAD(0x02F8, 0x006C, 3, 0x0000, 0, 0),
++	MX6_PAD_GPIO1_IO04__USDHC1_RESET_B                     = IOMUX_PAD(0x02F8, 0x006C, 4, 0x0000, 0, 0),
++	MX6_PAD_GPIO1_IO04__GPIO1_IO04                         = IOMUX_PAD(0x02F8, 0x006C, 5, 0x0000, 0, 0),
++	MX6_PAD_GPIO1_IO04__ENET2_1588_EVENT0_IN               = IOMUX_PAD(0x02F8, 0x006C, 6, 0x0000, 0, 0),
++	MX6_PAD_GPIO1_IO04__UART5_DCE_TX                       = IOMUX_PAD(0x02F8, 0x006C, 8, 0x0000, 0, 0),
++	MX6_PAD_GPIO1_IO04__UART5_DTE_RX                       = IOMUX_PAD(0x02F8, 0x006C, 8, 0x0644, 2, 0),
++
++	MX6_PAD_GPIO1_IO05__ENET2_REF_CLK2                     = IOMUX_PAD(0x02FC, 0x0070, 0, 0x057C, 1, 0),
++	MX6_PAD_GPIO1_IO05__PWM4_OUT                           = IOMUX_PAD(0x02FC, 0x0070, 1, 0x0000, 0, 0),
++	MX6_PAD_GPIO1_IO05__ANATOP_OTG2_ID                     = IOMUX_PAD(0x02FC, 0x0070, 2, 0x04BC, 0, 0),
++	MX6_PAD_GPIO1_IO05__CSI_FIELD                          = IOMUX_PAD(0x02FC, 0x0070, 3, 0x0530, 0, 0),
++	MX6_PAD_GPIO1_IO05__USDHC1_VSELECT                     = IOMUX_PAD(0x02FC, 0x0070, 4, 0x0000, 0, 0),
++	MX6_PAD_GPIO1_IO05__GPIO1_IO05                         = IOMUX_PAD(0x02FC, 0x0070, 5, 0x0000, 0, 0),
++	MX6_PAD_GPIO1_IO05__ENET2_1588_EVENT0_OUT              = IOMUX_PAD(0x02FC, 0x0070, 6, 0x0000, 0, 0),
++	MX6_PAD_GPIO1_IO05__UART5_DCE_RX                       = IOMUX_PAD(0x02FC, 0x0070, 8, 0x0644, 3, 0),
++	MX6_PAD_GPIO1_IO05__UART5_DTE_TX                       = IOMUX_PAD(0x02FC, 0x0070, 8, 0x0000, 0, 0),
++
++	MX6_PAD_GPIO1_IO06__ENET1_MDIO                         = IOMUX_PAD(0x0300, 0x0074, 0, 0x0578, 0, 0),
++	MX6_PAD_GPIO1_IO06__ENET2_MDIO                         = IOMUX_PAD(0x0300, 0x0074, 1, 0x0580, 0, 0),
++	MX6_PAD_GPIO1_IO06__USB_OTG_PWR_WAKE                   = IOMUX_PAD(0x0300, 0x0074, 2, 0x0000, 0, 0),
++	MX6_PAD_GPIO1_IO06__CSI_MCLK                           = IOMUX_PAD(0x0300, 0x0074, 3, 0x0000, 0, 0),
++	MX6_PAD_GPIO1_IO06__USDHC2_WP                          = IOMUX_PAD(0x0300, 0x0074, 4, 0x069C, 0, 0),
++	MX6_PAD_GPIO1_IO06__GPIO1_IO06                         = IOMUX_PAD(0x0300, 0x0074, 5, 0x0000, 0, 0),
++	MX6_PAD_GPIO1_IO06__CCM_WAIT                           = IOMUX_PAD(0x0300, 0x0074, 6, 0x0000, 0, 0),
++	MX6_PAD_GPIO1_IO06__CCM_REF_EN_B                       = IOMUX_PAD(0x0300, 0x0074, 7, 0x0000, 0, 0),
++	MX6_PAD_GPIO1_IO06__UART1_DCE_CTS                      = IOMUX_PAD(0x0300, 0x0074, 8, 0x0000, 0, 0),
++	MX6_PAD_GPIO1_IO06__UART1_DTE_RTS                      = IOMUX_PAD(0x0300, 0x0074, 8, 0x0620, 0, 0),
++
++	MX6_PAD_GPIO1_IO07__ENET1_MDC                          = IOMUX_PAD(0x0304, 0x0078, 0, 0x0000, 0, 0),
++	MX6_PAD_GPIO1_IO07__ENET2_MDC                          = IOMUX_PAD(0x0304, 0x0078, 1, 0x0000, 0, 0),
++	MX6_PAD_GPIO1_IO07__USB_OTG_HOST_MODE                  = IOMUX_PAD(0x0304, 0x0078, 2, 0x0000, 0, 0),
++	MX6_PAD_GPIO1_IO07__CSI_PIXCLK                         = IOMUX_PAD(0x0304, 0x0078, 3, 0x0528, 0, 0),
++	MX6_PAD_GPIO1_IO07__USDHC2_CD_B                        = IOMUX_PAD(0x0304, 0x0078, 4, 0x0674, 1, 0),
++	MX6_PAD_GPIO1_IO07__GPIO1_IO07                         = IOMUX_PAD(0x0304, 0x0078, 5, 0x0000, 0, 0),
++	MX6_PAD_GPIO1_IO07__CCM_STOP                           = IOMUX_PAD(0x0304, 0x0078, 6, 0x0000, 0, 0),
++	MX6_PAD_GPIO1_IO07__UART1_DCE_RTS                      = IOMUX_PAD(0x0304, 0x0078, 8, 0x0620, 1, 0),
++	MX6_PAD_GPIO1_IO07__UART1_DTE_CTS                      = IOMUX_PAD(0x0304, 0x0078, 8, 0x0000, 0, 0),
++
++	MX6_PAD_GPIO1_IO08__PWM1_OUT                           = IOMUX_PAD(0x0308, 0x007C, 0, 0x0000, 0, 0),
++	MX6_PAD_GPIO1_IO08__WDOG1_WDOG_B                       = IOMUX_PAD(0x0308, 0x007C, 1, 0x0000, 0, 0),
++	MX6_PAD_GPIO1_IO08__SPDIF_OUT                          = IOMUX_PAD(0x0308, 0x007C, 2, 0x0000, 0, 0),
++	MX6_PAD_GPIO1_IO08__CSI_VSYNC                          = IOMUX_PAD(0x0308, 0x007C, 3, 0x052C, 1, 0),
++	MX6_PAD_GPIO1_IO08__USDHC2_VSELECT                     = IOMUX_PAD(0x0308, 0x007C, 4, 0x0000, 0, 0),
++	MX6_PAD_GPIO1_IO08__GPIO1_IO08                         = IOMUX_PAD(0x0308, 0x007C, 5, 0x0000, 0, 0),
++	MX6_PAD_GPIO1_IO08__CCM_PMIC_RDY                       = IOMUX_PAD(0x0308, 0x007C, 6, 0x04C0, 1, 0),
++	MX6_PAD_GPIO1_IO08__UART5_DCE_RTS                      = IOMUX_PAD(0x0308, 0x007C, 8, 0x0640, 1, 0),
++	MX6_PAD_GPIO1_IO08__UART5_DTE_CTS                      = IOMUX_PAD(0x0308, 0x007C, 8, 0x0000, 0, 0),
++
++	MX6_PAD_GPIO1_IO09__PWM2_OUT                           = IOMUX_PAD(0x030C, 0x0080, 0, 0x0000, 0, 0),
++	MX6_PAD_GPIO1_IO09__WDOG1_WDOG_ANY                     = IOMUX_PAD(0x030C, 0x0080, 1, 0x0000, 0, 0),
++	MX6_PAD_GPIO1_IO09__SPDIF_IN                           = IOMUX_PAD(0x030C, 0x0080, 2, 0x0618, 0, 0),
++	MX6_PAD_GPIO1_IO09__CSI_HSYNC                          = IOMUX_PAD(0x030C, 0x0080, 3, 0x0524, 1, 0),
++	MX6_PAD_GPIO1_IO09__USDHC2_RESET_B                     = IOMUX_PAD(0x030C, 0x0080, 4, 0x0000, 0, 0),
++	MX6_PAD_GPIO1_IO09__GPIO1_IO09                         = IOMUX_PAD(0x030C, 0x0080, 5, 0x0000, 0, 0),
++	MX6_PAD_GPIO1_IO09__USDHC1_RESET_B                     = IOMUX_PAD(0x030C, 0x0080, 6, 0x0000, 0, 0),
++	MX6_PAD_GPIO1_IO09__UART5_DCE_CTS                      = IOMUX_PAD(0x030C, 0x0080, 8, 0x0000, 0, 0),
++	MX6_PAD_GPIO1_IO09__UART5_DTE_RTS                      = IOMUX_PAD(0x030C, 0x0080, 8, 0x0640, 2, 0),
++
++	MX6_PAD_UART1_TX_DATA__UART1_DCE_TX                    = IOMUX_PAD(0x0310, 0x0084, 0, 0x0000, 0, 0),
++
++	MX6_PAD_UART1_TX_DATA__UART1_DTE_RX                    = IOMUX_PAD(0x0310, 0x0084, 0, 0x0624, 2, 0),
++	MX6_PAD_UART1_TX_DATA__ENET1_RDATA02                   = IOMUX_PAD(0x0310, 0x0084, 1, 0x0000, 0, 0),
++	MX6_PAD_UART1_TX_DATA__I2C3_SCL                        = IOMUX_PAD(0x0310, 0x0084, IOMUX_CONFIG_SION | 2, 0x05B4, 0, 0),
++	MX6_PAD_UART1_TX_DATA__CSI_DATA02                      = IOMUX_PAD(0x0310, 0x0084, 3, 0x04C4, 1, 0),
++	MX6_PAD_UART1_TX_DATA__GPT1_COMPARE1                   = IOMUX_PAD(0x0310, 0x0084, 4, 0x0000, 0, 0),
++	MX6_PAD_UART1_TX_DATA__GPIO1_IO16                      = IOMUX_PAD(0x0310, 0x0084, 5, 0x0000, 0, 0),
++	MX6_PAD_UART1_TX_DATA__SPDIF_OUT                       = IOMUX_PAD(0x0310, 0x0084, 8, 0x0000, 0, 0),
++
++	MX6_PAD_UART1_RX_DATA__UART1_DCE_RX                    = IOMUX_PAD(0x0314, 0x0088, 0, 0x0624, 3, 0),
++
++	MX6_PAD_UART1_RX_DATA__UART1_DTE_TX                    = IOMUX_PAD(0x0314, 0x0088, 0, 0x0000, 0, 0),
++	MX6_PAD_UART1_RX_DATA__ENET1_RDATA03                   = IOMUX_PAD(0x0314, 0x0088, 1, 0x0000, 0, 0),
++	MX6_PAD_UART1_RX_DATA__I2C3_SDA                        = IOMUX_PAD(0x0314, 0x0088, IOMUX_CONFIG_SION | 2, 0x05B8, 0, 0),
++	MX6_PAD_UART1_RX_DATA__CSI_DATA03                      = IOMUX_PAD(0x0314, 0x0088, 3, 0x04C8, 1, 0),
++	MX6_PAD_UART1_RX_DATA__GPT1_CLK                        = IOMUX_PAD(0x0314, 0x0088, 4, 0x0594, 0, 0),
++	MX6_PAD_UART1_RX_DATA__GPIO1_IO17                      = IOMUX_PAD(0x0314, 0x0088, 5, 0x0000, 0, 0),
++	MX6_PAD_UART1_RX_DATA__SPDIF_IN                        = IOMUX_PAD(0x0314, 0x0088, 8, 0x0618, 1, 0),
++
++	MX6_PAD_UART1_CTS_B__UART1_DCE_CTS                     = IOMUX_PAD(0x0318, 0x008C, 0, 0x0000, 0, 0),
++
++	MX6_PAD_UART1_CTS_B__UART1_DTE_RTS                     = IOMUX_PAD(0x0318, 0x008C, 0, 0x0620, 2, 0),
++	MX6_PAD_UART1_CTS_B__ENET1_RX_CLK                      = IOMUX_PAD(0x0318, 0x008C, 1, 0x0000, 0, 0),
++	MX6_PAD_UART1_CTS_B__USDHC1_WP                         = IOMUX_PAD(0x0318, 0x008C, 2, 0x066C, 1, 0),
++	MX6_PAD_UART1_CTS_B__CSI_DATA04                        = IOMUX_PAD(0x0318, 0x008C, 3, 0x04D8, 0, 0),
++	MX6_PAD_UART1_CTS_B__ENET2_1588_EVENT1_IN              = IOMUX_PAD(0x0318, 0x008C, 4, 0x0000, 0, 0),
++	MX6_PAD_UART1_CTS_B__GPIO1_IO18                        = IOMUX_PAD(0x0318, 0x008C, 5, 0x0000, 0, 0),
++	MX6_PAD_UART1_CTS_B__USDHC2_WP                         = IOMUX_PAD(0x0318, 0x008C, 8, 0x069C, 1, 0),
++
++	MX6_PAD_UART1_RTS_B__UART1_DCE_RTS                     = IOMUX_PAD(0x031C, 0x0090, 0, 0x0620, 3, 0),
++
++	MX6_PAD_UART1_RTS_B__UART1_DTE_CTS                     = IOMUX_PAD(0x031C, 0x0090, 0, 0x0000, 0, 0),
++	MX6_PAD_UART1_RTS_B__ENET1_TX_ER                       = IOMUX_PAD(0x031C, 0x0090, 1, 0x0000, 0, 0),
++	MX6_PAD_UART1_RTS_B__USDHC1_CD_B                       = IOMUX_PAD(0x031C, 0x0090, 2, 0x0668, 1, 0),
++	MX6_PAD_UART1_RTS_B__CSI_DATA05                        = IOMUX_PAD(0x031C, 0x0090, 3, 0x04CC, 1, 0),
++	MX6_PAD_UART1_RTS_B__ENET2_1588_EVENT1_OUT             = IOMUX_PAD(0x031C, 0x0090, 4, 0x0000, 0, 0),
++	MX6_PAD_UART1_RTS_B__GPIO1_IO19                        = IOMUX_PAD(0x031C, 0x0090, 5, 0x0000, 0, 0),
++	MX6_PAD_UART1_RTS_B__USDHC2_CD_B                       = IOMUX_PAD(0x031C, 0x0090, 8, 0x0674, 2, 0),
++
++	MX6_PAD_UART2_TX_DATA__UART2_DCE_TX                    = IOMUX_PAD(0x0320, 0x0094, 0, 0x0000, 0, 0),
++
++	MX6_PAD_UART2_TX_DATA__UART2_DTE_RX                    = IOMUX_PAD(0x0320, 0x0094, 0, 0x062C, 0, 0),
++	MX6_PAD_UART2_TX_DATA__ENET1_TDATA02                   = IOMUX_PAD(0x0320, 0x0094, 1, 0x0000, 0, 0),
++	MX6_PAD_UART2_TX_DATA__I2C4_SCL                        = IOMUX_PAD(0x0320, 0x0094, IOMUX_CONFIG_SION | 2, 0x05BC, 0, 0),
++	MX6_PAD_UART2_TX_DATA__CSI_DATA06                      = IOMUX_PAD(0x0320, 0x0094, 3, 0x04DC, 0, 0),
++	MX6_PAD_UART2_TX_DATA__GPT1_CAPTURE1                   = IOMUX_PAD(0x0320, 0x0094, 4, 0x058C, 1, 0),
++	MX6_PAD_UART2_TX_DATA__GPIO1_IO20                      = IOMUX_PAD(0x0320, 0x0094, 5, 0x0000, 0, 0),
++	MX6_PAD_UART2_TX_DATA__ECSPI3_SS0                      = IOMUX_PAD(0x0320, 0x0094, 8, 0x0560, 0, 0),
++
++	MX6_PAD_UART2_RX_DATA__UART2_DCE_RX                    = IOMUX_PAD(0x0324, 0x0098, 0, 0x062C, 1, 0),
++
++	MX6_PAD_UART2_RX_DATA__UART2_DTE_TX                    = IOMUX_PAD(0x0324, 0x0098, 0, 0x0000, 0, 0),
++	MX6_PAD_UART2_RX_DATA__ENET1_TDATA03                   = IOMUX_PAD(0x0324, 0x0098, 1, 0x0000, 0, 0),
++	MX6_PAD_UART2_RX_DATA__I2C4_SDA                        = IOMUX_PAD(0x0324, 0x0098, IOMUX_CONFIG_SION | 2, 0x05C0, 0, 0),
++	MX6_PAD_UART2_RX_DATA__CSI_DATA07                      = IOMUX_PAD(0x0324, 0x0098, 3, 0x04E0, 0, 0),
++	MX6_PAD_UART2_RX_DATA__GPT1_CAPTURE2                   = IOMUX_PAD(0x0324, 0x0098, 4, 0x0590, 0, 0),
++	MX6_PAD_UART2_RX_DATA__GPIO1_IO21                      = IOMUX_PAD(0x0324, 0x0098, 5, 0x0000, 0, 0),
++	MX6_PAD_UART2_RX_DATA__SJC_DONE                        = IOMUX_PAD(0x0324, 0x0098, 7, 0x0000, 0, 0),
++	MX6_PAD_UART2_RX_DATA__ECSPI3_SCLK                     = IOMUX_PAD(0x0324, 0x0098, 8, 0x0554, 0, 0),
++
++	MX6_PAD_UART2_CTS_B__UART2_DCE_CTS                     = IOMUX_PAD(0x0328, 0x009C, 0, 0x0000, 0, 0),
++
++	MX6_PAD_UART2_CTS_B__UART2_DTE_RTS                     = IOMUX_PAD(0x0328, 0x009C, 0, 0x0628, 0, 0),
++	MX6_PAD_UART2_CTS_B__ENET1_CRS                         = IOMUX_PAD(0x0328, 0x009C, 1, 0x0000, 0, 0),
++	MX6_PAD_UART2_CTS_B__FLEXCAN2_TX                       = IOMUX_PAD(0x0328, 0x009C, 2, 0x0000, 0, 0),
++	MX6_PAD_UART2_CTS_B__CSI_DATA08                        = IOMUX_PAD(0x0328, 0x009C, 3, 0x04E4, 0, 0),
++	MX6_PAD_UART2_CTS_B__GPT1_COMPARE2                     = IOMUX_PAD(0x0328, 0x009C, 4, 0x0000, 0, 0),
++	MX6_PAD_UART2_CTS_B__GPIO1_IO22                        = IOMUX_PAD(0x0328, 0x009C, 5, 0x0000, 0, 0),
++	MX6_PAD_UART2_CTS_B__SJC_DE_B                          = IOMUX_PAD(0x0328, 0x009C, 7, 0x0000, 0, 0),
++	MX6_PAD_UART2_CTS_B__ECSPI3_MOSI                       = IOMUX_PAD(0x0328, 0x009C, 8, 0x055C, 0, 0),
++
++	MX6_PAD_UART2_RTS_B__UART2_DCE_RTS                     = IOMUX_PAD(0x032C, 0x00A0, 0, 0x0628, 1, 0),
++
++	MX6_PAD_UART2_RTS_B__UART2_DTE_CTS                     = IOMUX_PAD(0x032C, 0x00A0, 0, 0x0000, 0, 0),
++	MX6_PAD_UART2_RTS_B__ENET1_COL                         = IOMUX_PAD(0x032C, 0x00A0, 1, 0x0000, 0, 0),
++	MX6_PAD_UART2_RTS_B__FLEXCAN2_RX                       = IOMUX_PAD(0x032C, 0x00A0, 2, 0x0588, 0, 0),
++	MX6_PAD_UART2_RTS_B__CSI_DATA09                        = IOMUX_PAD(0x032C, 0x00A0, 3, 0x04E8, 0, 0),
++	MX6_PAD_UART2_RTS_B__GPT1_COMPARE3                     = IOMUX_PAD(0x032C, 0x00A0, 4, 0x0000, 0, 0),
++	MX6_PAD_UART2_RTS_B__GPIO1_IO23                        = IOMUX_PAD(0x032C, 0x00A0, 5, 0x0000, 0, 0),
++	MX6_PAD_UART2_RTS_B__SJC_FAIL                          = IOMUX_PAD(0x032C, 0x00A0, 7, 0x0000, 0, 0),
++	MX6_PAD_UART2_RTS_B__ECSPI3_MISO                       = IOMUX_PAD(0x032C, 0x00A0, 8, 0x0558, 0, 0),
++
++	MX6_PAD_UART3_TX_DATA__UART3_DCE_TX                    = IOMUX_PAD(0x0330, 0x00A4, 0, 0x0000, 0, 0),
++
++	MX6_PAD_UART3_TX_DATA__UART3_DTE_RX                    = IOMUX_PAD(0x0330, 0x00A4, 0, 0x0634, 0, 0),
++	MX6_PAD_UART3_TX_DATA__ENET2_RDATA02                   = IOMUX_PAD(0x0330, 0x00A4, 1, 0x0000, 0, 0),
++	MX6_PAD_UART3_TX_DATA__SIM1_PORT0_PD                   = IOMUX_PAD(0x0330, 0x00A4, 2, 0x0000, 0, 0),
++	MX6_PAD_UART3_TX_DATA__CSI_DATA01                      = IOMUX_PAD(0x0330, 0x00A4, 3, 0x04D4, 0, 0),
++	MX6_PAD_UART3_TX_DATA__UART2_DCE_CTS                   = IOMUX_PAD(0x0330, 0x00A4, 4, 0x0000, 0, 0),
++	MX6_PAD_UART3_TX_DATA__UART2_DTE_RTS                   = IOMUX_PAD(0x0330, 0x00A4, 4, 0x0628, 2, 0),
++	MX6_PAD_UART3_TX_DATA__GPIO1_IO24                      = IOMUX_PAD(0x0330, 0x00A4, 5, 0x0000, 0, 0),
++	MX6_PAD_UART3_TX_DATA__SJC_JTAG_ACT                    = IOMUX_PAD(0x0330, 0x00A4, 7, 0x0000, 0, 0),
++	MX6_PAD_UART3_TX_DATA__ANATOP_OTG1_ID                  = IOMUX_PAD(0x0330, 0x00A4, 8, 0x04B8, 1, 0),
++
++	MX6_PAD_UART3_RX_DATA__UART3_DCE_RX                    = IOMUX_PAD(0x0334, 0x00A8, 0, 0x0634, 1, 0),
++
++	MX6_PAD_UART3_RX_DATA__UART3_DTE_TX                    = IOMUX_PAD(0x0334, 0x00A8, 0, 0x0000, 0, 0),
++	MX6_PAD_UART3_RX_DATA__ENET2_RDATA03                   = IOMUX_PAD(0x0334, 0x00A8, 1, 0x0000, 0, 0),
++	MX6_PAD_UART3_RX_DATA__SIM2_PORT0_PD                   = IOMUX_PAD(0x0334, 0x00A8, 2, 0x0000, 0, 0),
++	MX6_PAD_UART3_RX_DATA__CSI_DATA00                      = IOMUX_PAD(0x0334, 0x00A8, 3, 0x04D0, 0, 0),
++	MX6_PAD_UART3_RX_DATA__UART2_DCE_RTS                   = IOMUX_PAD(0x0334, 0x00A8, 4, 0x0628, 3, 0),
++	MX6_PAD_UART3_RX_DATA__UART2_DTE_CTS                   = IOMUX_PAD(0x0334, 0x00A8, 4, 0x0000, 0, 0),
++	MX6_PAD_UART3_RX_DATA__GPIO1_IO25                      = IOMUX_PAD(0x0334, 0x00A8, 5, 0x0000, 0, 0),
++	MX6_PAD_UART3_RX_DATA__EPIT1_OUT                       = IOMUX_PAD(0x0334, 0x00A8, 8, 0x0000, 0, 0),
++
++	MX6_PAD_UART3_CTS_B__UART3_DCE_CTS                     = IOMUX_PAD(0x0338, 0x00AC, 0, 0x0000, 0, 0),
++
++	MX6_PAD_UART3_CTS_B__UART3_DTE_RTS                     = IOMUX_PAD(0x0338, 0x00AC, 0, 0x0630, 0, 0),
++	MX6_PAD_UART3_CTS_B__ENET2_RX_CLK                      = IOMUX_PAD(0x0338, 0x00AC, IOMUX_CONFIG_SION | 1, 0x0000, 0, 0),
++	MX6_PAD_UART3_CTS_B__FLEXCAN1_TX                       = IOMUX_PAD(0x0338, 0x00AC, 2, 0x0000, 0, 0),
++	MX6_PAD_UART3_CTS_B__CSI_DATA10                        = IOMUX_PAD(0x0338, 0x00AC, 3, 0x04EC, 0, 0),
++	MX6_PAD_UART3_CTS_B__ENET1_1588_EVENT1_IN              = IOMUX_PAD(0x0338, 0x00AC, 4, 0x0000, 0, 0),
++	MX6_PAD_UART3_CTS_B__GPIO1_IO26                        = IOMUX_PAD(0x0338, 0x00AC, 5, 0x0000, 0, 0),
++	MX6_PAD_UART3_CTS_B__EPIT2_OUT                         = IOMUX_PAD(0x0338, 0x00AC, 8, 0x0000, 0, 0),
++
++	MX6_PAD_UART3_RTS_B__UART3_DCE_RTS                     = IOMUX_PAD(0x033C, 0x00B0, 0, 0x0630, 1, 0),
++
++	MX6_PAD_UART3_RTS_B__UART3_DTE_CTS                     = IOMUX_PAD(0x033C, 0x00B0, 0, 0x0000, 0, 0),
++	MX6_PAD_UART3_RTS_B__ENET2_TX_ER                       = IOMUX_PAD(0x033C, 0x00B0, 1, 0x0000, 0, 0),
++	MX6_PAD_UART3_RTS_B__FLEXCAN1_RX                       = IOMUX_PAD(0x033C, 0x00B0, 2, 0x0584, 0, 0),
++	MX6_PAD_UART3_RTS_B__CSI_DATA11                        = IOMUX_PAD(0x033C, 0x00B0, 3, 0x04F0, 0, 0),
++	MX6_PAD_UART3_RTS_B__ENET1_1588_EVENT1_OUT             = IOMUX_PAD(0x033C, 0x00B0, 4, 0x0000, 0, 0),
++	MX6_PAD_UART3_RTS_B__GPIO1_IO27                        = IOMUX_PAD(0x033C, 0x00B0, 5, 0x0000, 0, 0),
++	MX6_PAD_UART3_RTS_B__WDOG1_WDOG_B                      = IOMUX_PAD(0x033C, 0x00B0, 8, 0x0000, 0, 0),
++
++	MX6_PAD_UART4_TX_DATA__UART4_DCE_TX                    = IOMUX_PAD(0x0340, 0x00B4, 0, 0x0000, 0, 0),
++
++	MX6_PAD_UART4_TX_DATA__UART4_DTE_RX                    = IOMUX_PAD(0x0340, 0x00B4, 0, 0x063C, 0, 0),
++	MX6_PAD_UART4_TX_DATA__ENET2_TDATA02                   = IOMUX_PAD(0x0340, 0x00B4, 1, 0x0000, 0, 0),
++	MX6_PAD_UART4_TX_DATA__I2C1_SCL                        = IOMUX_PAD(0x0340, 0x00B4, IOMUX_CONFIG_SION | 2, 0x05A4, 1, 0),
++	MX6_PAD_UART4_TX_DATA__CSI_DATA12                      = IOMUX_PAD(0x0340, 0x00B4, 3, 0x04F4, 0, 0),
++	MX6_PAD_UART4_TX_DATA__CSU_CSU_ALARM_AUT02             = IOMUX_PAD(0x0340, 0x00B4, 4, 0x0000, 0, 0),
++	MX6_PAD_UART4_TX_DATA__GPIO1_IO28                      = IOMUX_PAD(0x0340, 0x00B4, 5, 0x0000, 0, 0),
++	MX6_PAD_UART4_TX_DATA__ECSPI2_SCLK                     = IOMUX_PAD(0x0340, 0x00B4, 8, 0x0544, 1, 0),
++
++	MX6_PAD_UART4_RX_DATA__UART4_DCE_RX                    = IOMUX_PAD(0x0344, 0x00B8, 0, 0x063C, 1, 0),
++
++	MX6_PAD_UART4_RX_DATA__UART4_DTE_TX                    = IOMUX_PAD(0x0344, 0x00B8, 0, 0x0000, 0, 0),
++	MX6_PAD_UART4_RX_DATA__ENET2_TDATA03                   = IOMUX_PAD(0x0344, 0x00B8, 1, 0x0000, 0, 0),
++	MX6_PAD_UART4_RX_DATA__I2C1_SDA                        = IOMUX_PAD(0x0344, 0x00B8, IOMUX_CONFIG_SION | 2, 0x05A8, 2, 0),
++	MX6_PAD_UART4_RX_DATA__CSI_DATA13                      = IOMUX_PAD(0x0344, 0x00B8, 3, 0x04F8, 0, 0),
++	MX6_PAD_UART4_RX_DATA__CSU_CSU_ALARM_AUT01             = IOMUX_PAD(0x0344, 0x00B8, 4, 0x0000, 0, 0),
++	MX6_PAD_UART4_RX_DATA__GPIO1_IO29                      = IOMUX_PAD(0x0344, 0x00B8, 5, 0x0000, 0, 0),
++	MX6_PAD_UART4_RX_DATA__ECSPI2_SS0                      = IOMUX_PAD(0x0344, 0x00B8, 8, 0x0550, 1, 0),
++	MX6_PAD_UART5_TX_DATA__GPIO1_IO30                      = IOMUX_PAD(0x0348, 0x00BC, 5, 0x0000, 0, 0),
++	MX6_PAD_UART5_TX_DATA__ECSPI2_MOSI                     = IOMUX_PAD(0x0348, 0x00BC, 8, 0x054C, 0, 0),
++
++	MX6_PAD_UART5_TX_DATA__UART5_DCE_TX                    = IOMUX_PAD(0x0348, 0x00BC, 0, 0x0000, 0, 0),
++
++	MX6_PAD_UART5_TX_DATA__UART5_DTE_RX                    = IOMUX_PAD(0x0348, 0x00BC, 0, 0x0644, 4, 0),
++	MX6_PAD_UART5_TX_DATA__ENET2_CRS                       = IOMUX_PAD(0x0348, 0x00BC, 1, 0x0000, 0, 0),
++	MX6_PAD_UART5_TX_DATA__I2C2_SCL                        = IOMUX_PAD(0x0348, 0x00BC, IOMUX_CONFIG_SION | 2, 0x05AC, 2, 0),
++	MX6_PAD_UART5_TX_DATA__CSI_DATA14                      = IOMUX_PAD(0x0348, 0x00BC, 3, 0x04FC, 0, 0),
++	MX6_PAD_UART5_TX_DATA__CSU_CSU_ALARM_AUT00             = IOMUX_PAD(0x0348, 0x00BC, 4, 0x0000, 0, 0),
++
++	MX6_PAD_UART5_RX_DATA__UART5_DCE_RX                    = IOMUX_PAD(0x034C, 0x00C0, 0, 0x0644, 5, 0),
++
++	MX6_PAD_UART5_RX_DATA__UART5_DTE_TX                    = IOMUX_PAD(0x034C, 0x00C0, 0, 0x0000, 0, 0),
++	MX6_PAD_UART5_RX_DATA__ENET2_COL                       = IOMUX_PAD(0x034C, 0x00C0, 1, 0x0000, 0, 0),
++	MX6_PAD_UART5_RX_DATA__I2C2_SDA                        = IOMUX_PAD(0x034C, 0x00C0, IOMUX_CONFIG_SION | 2, 0x05B0, 2, 0),
++	MX6_PAD_UART5_RX_DATA__CSI_DATA15                      = IOMUX_PAD(0x034C, 0x00C0, 3, 0x0500, 0, 0),
++	MX6_PAD_UART5_RX_DATA__CSU_CSU_INT_DEB                 = IOMUX_PAD(0x034C, 0x00C0, 4, 0x0000, 0, 0),
++	MX6_PAD_UART5_RX_DATA__GPIO1_IO31                      = IOMUX_PAD(0x034C, 0x00C0, 5, 0x0000, 0, 0),
++	MX6_PAD_UART5_RX_DATA__ECSPI2_MISO                     = IOMUX_PAD(0x034C, 0x00C0, 8, 0x0548, 1, 0),
++
++	MX6_PAD_ENET1_RX_DATA0__ENET1_RDATA00                  = IOMUX_PAD(0x0350, 0x00C4, 0, 0x0000, 0, 0),
++	MX6_PAD_ENET1_RX_DATA0__UART4_DCE_RTS                  = IOMUX_PAD(0x0350, 0x00C4, 1, 0x0638, 0, 0),
++	MX6_PAD_ENET1_RX_DATA0__UART4_DTE_CTS                  = IOMUX_PAD(0x0350, 0x00C4, 1, 0x0000, 0, 0),
++	MX6_PAD_ENET1_RX_DATA0__PWM1_OUT                       = IOMUX_PAD(0x0350, 0x00C4, 2, 0x0000, 0, 0),
++	MX6_PAD_ENET1_RX_DATA0__CSI_DATA16                     = IOMUX_PAD(0x0350, 0x00C4, 3, 0x0504, 0, 0),
++	MX6_PAD_ENET1_RX_DATA0__FLEXCAN1_TX                    = IOMUX_PAD(0x0350, 0x00C4, 4, 0x0000, 0, 0),
++	MX6_PAD_ENET1_RX_DATA0__GPIO2_IO00                     = IOMUX_PAD(0x0350, 0x00C4, 5, 0x0000, 0, 0),
++	MX6_PAD_ENET1_RX_DATA0__KPP_ROW00                      = IOMUX_PAD(0x0350, 0x00C4, 6, 0x05D0, 0, 0),
++	MX6_PAD_ENET1_RX_DATA0__USDHC1_LCTL                    = IOMUX_PAD(0x0350, 0x00C4, 8, 0x0000, 0, 0),
++
++	MX6_PAD_ENET1_RX_DATA1__ENET1_RDATA01                  = IOMUX_PAD(0x0354, 0x00C8, 0, 0x0000, 0, 0),
++	MX6_PAD_ENET1_RX_DATA1__UART4_DCE_CTS                  = IOMUX_PAD(0x0354, 0x00C8, 1, 0x0000, 0, 0),
++	MX6_PAD_ENET1_RX_DATA1__UART4_DTE_RTS                  = IOMUX_PAD(0x0354, 0x00C8, 1, 0x0638, 1, 0),
++	MX6_PAD_ENET1_RX_DATA1__PWM2_OUT                       = IOMUX_PAD(0x0354, 0x00C8, 2, 0x0000, 0, 0),
++	MX6_PAD_ENET1_RX_DATA1__CSI_DATA17                     = IOMUX_PAD(0x0354, 0x00C8, 3, 0x0508, 0, 0),
++	MX6_PAD_ENET1_RX_DATA1__FLEXCAN1_RX                    = IOMUX_PAD(0x0354, 0x00C8, 4, 0x0584, 1, 0),
++	MX6_PAD_ENET1_RX_DATA1__GPIO2_IO01                     = IOMUX_PAD(0x0354, 0x00C8, 5, 0x0000, 0, 0),
++	MX6_PAD_ENET1_RX_DATA1__KPP_COL00                      = IOMUX_PAD(0x0354, 0x00C8, 6, 0x05C4, 0, 0),
++	MX6_PAD_ENET1_RX_DATA1__USDHC2_LCTL                    = IOMUX_PAD(0x0354, 0x00C8, 8, 0x0000, 0, 0),
++
++	MX6_PAD_ENET1_RX_EN__ENET1_RX_EN                       = IOMUX_PAD(0x0358, 0x00CC, 0, 0x0000, 0, 0),
++	MX6_PAD_ENET1_RX_EN__UART5_DCE_RTS                     = IOMUX_PAD(0x0358, 0x00CC, 1, 0x0640, 3, 0),
++	MX6_PAD_ENET1_RX_EN__UART5_DTE_CTS                     = IOMUX_PAD(0x0358, 0x00CC, 1, 0x0000, 0, 0),
++	MX6_PAD_ENET1_RX_EN__REF_CLK_32K                       = IOMUX_PAD(0x0358, 0x00CC, 2, 0x0000, 0, 0),
++	MX6_PAD_ENET1_RX_EN__CSI_DATA18                        = IOMUX_PAD(0x0358, 0x00CC, 3, 0x050C, 0, 0),
++	MX6_PAD_ENET1_RX_EN__FLEXCAN2_TX                       = IOMUX_PAD(0x0358, 0x00CC, 4, 0x0000, 0, 0),
++	MX6_PAD_ENET1_RX_EN__GPIO2_IO02                        = IOMUX_PAD(0x0358, 0x00CC, 5, 0x0000, 0, 0),
++	MX6_PAD_ENET1_RX_EN__KPP_ROW01                         = IOMUX_PAD(0x0358, 0x00CC, 6, 0x05D4, 0, 0),
++	MX6_PAD_ENET1_RX_EN__USDHC1_VSELECT                    = IOMUX_PAD(0x0358, 0x00CC, 8, 0x0000, 0, 0),
++
++	MX6_PAD_ENET1_TX_DATA0__ENET1_TDATA00                  = IOMUX_PAD(0x035C, 0x00D0, 0, 0x0000, 0, 0),
++	MX6_PAD_ENET1_TX_DATA0__UART5_DCE_CTS                  = IOMUX_PAD(0x035C, 0x00D0, 1, 0x0000, 0, 0),
++	MX6_PAD_ENET1_TX_DATA0__UART5_DTE_RTS                  = IOMUX_PAD(0x035C, 0x00D0, 1, 0x0640, 4, 0),
++	MX6_PAD_ENET1_TX_DATA0__REF_CLK_24M                    = IOMUX_PAD(0x035C, 0x00D0, 2, 0x0000, 0, 0),
++	MX6_PAD_ENET1_TX_DATA0__CSI_DATA19                     = IOMUX_PAD(0x035C, 0x00D0, 3, 0x0510, 0, 0),
++	MX6_PAD_ENET1_TX_DATA0__FLEXCAN2_RX                    = IOMUX_PAD(0x035C, 0x00D0, 4, 0x0588, 1, 0),
++	MX6_PAD_ENET1_TX_DATA0__GPIO2_IO03                     = IOMUX_PAD(0x035C, 0x00D0, 5, 0x0000, 0, 0),
++	MX6_PAD_ENET1_TX_DATA0__KPP_COL01                      = IOMUX_PAD(0x035C, 0x00D0, 6, 0x05C8, 0, 0),
++	MX6_PAD_ENET1_TX_DATA0__USDHC2_VSELECT                 = IOMUX_PAD(0x035C, 0x00D0, 8, 0x0000, 0, 0),
++
++	MX6_PAD_ENET1_TX_DATA1__ENET1_TDATA01                  = IOMUX_PAD(0x0360, 0x00D4, 0, 0x0000, 0, 0),
++	MX6_PAD_ENET1_TX_DATA1__UART6_DCE_CTS                  = IOMUX_PAD(0x0360, 0x00D4, 1, 0x0000, 0, 0),
++	MX6_PAD_ENET1_TX_DATA1__UART6_DTE_RTS                  = IOMUX_PAD(0x0360, 0x00D4, 1, 0x0648, 2, 0),
++	MX6_PAD_ENET1_TX_DATA1__PWM5_OUT                       = IOMUX_PAD(0x0360, 0x00D4, 2, 0x0000, 0, 0),
++	MX6_PAD_ENET1_TX_DATA1__CSI_DATA20                     = IOMUX_PAD(0x0360, 0x00D4, 3, 0x0514, 0, 0),
++	MX6_PAD_ENET1_TX_DATA1__ENET2_MDIO                     = IOMUX_PAD(0x0360, 0x00D4, 4, 0x0580, 1, 0),
++	MX6_PAD_ENET1_TX_DATA1__GPIO2_IO04                     = IOMUX_PAD(0x0360, 0x00D4, 5, 0x0000, 0, 0),
++	MX6_PAD_ENET1_TX_DATA1__KPP_ROW02                      = IOMUX_PAD(0x0360, 0x00D4, 6, 0x05D8, 0, 0),
++	MX6_PAD_ENET1_TX_DATA1__WDOG1_WDOG_RST_B_DEB           = IOMUX_PAD(0x0360, 0x00D4, 8, 0x0000, 0, 0),
++
++	MX6_PAD_ENET1_TX_EN__ENET1_TX_EN                       = IOMUX_PAD(0x0364, 0x00D8, 0, 0x0000, 0, 0),
++	MX6_PAD_ENET1_TX_EN__UART6_DCE_RTS                     = IOMUX_PAD(0x0364, 0x00D8, 1, 0x0648, 3, 0),
++	MX6_PAD_ENET1_TX_EN__UART6_DTE_CTS                     = IOMUX_PAD(0x0364, 0x00D8, 1, 0x0000, 0, 0),
++	MX6_PAD_ENET1_TX_EN__PWM6_OUT                          = IOMUX_PAD(0x0364, 0x00D8, 2, 0x0000, 0, 0),
++	MX6_PAD_ENET1_TX_EN__CSI_DATA21                        = IOMUX_PAD(0x0364, 0x00D8, 3, 0x0518, 0, 0),
++	MX6_PAD_ENET1_TX_EN__ENET2_MDC                         = IOMUX_PAD(0x0364, 0x00D8, 4, 0x0000, 0, 0),
++	MX6_PAD_ENET1_TX_EN__GPIO2_IO05                        = IOMUX_PAD(0x0364, 0x00D8, 5, 0x0000, 0, 0),
++	MX6_PAD_ENET1_TX_EN__KPP_COL02                         = IOMUX_PAD(0x0364, 0x00D8, 6, 0x05CC, 0, 0),
++	MX6_PAD_ENET1_TX_EN__WDOG2_WDOG_RST_B_DEB              = IOMUX_PAD(0x0364, 0x00D8, 8, 0x0000, 0, 0),
++
++	MX6_PAD_ENET1_TX_CLK__ENET1_TX_CLK                     = IOMUX_PAD(0x0368, 0x00DC, 0, 0x0000, 0, 0),
++	MX6_PAD_ENET1_TX_CLK__UART7_DCE_CTS                    = IOMUX_PAD(0x0368, 0x00DC, 1, 0x0000, 0, 0),
++	MX6_PAD_ENET1_TX_CLK__UART7_DTE_RTS                    = IOMUX_PAD(0x0368, 0x00DC, 1, 0x0650, 0, 0),
++	MX6_PAD_ENET1_TX_CLK__PWM7_OUT                         = IOMUX_PAD(0x0368, 0x00DC, 2, 0x0000, 0, 0),
++	MX6_PAD_ENET1_TX_CLK__CSI_DATA22                       = IOMUX_PAD(0x0368, 0x00DC, 3, 0x051C, 0, 0),
++	MX6_PAD_ENET1_TX_CLK__ENET1_REF_CLK1                   = IOMUX_PAD(0x0368, 0x00DC, IOMUX_CONFIG_SION | 4, 0x0574, 2, 0),
++	MX6_PAD_ENET1_TX_CLK__GPIO2_IO06                       = IOMUX_PAD(0x0368, 0x00DC, 5, 0x0000, 0, 0),
++	MX6_PAD_ENET1_TX_CLK__KPP_ROW03                        = IOMUX_PAD(0x0368, 0x00DC, 6, 0x0000, 0, 0),
++	MX6_PAD_ENET1_TX_CLK__GPT1_CLK                         = IOMUX_PAD(0x0368, 0x00DC, 8, 0x0594, 1, 0),
++
++	MX6_PAD_ENET1_RX_ER__ENET1_RX_ER                       = IOMUX_PAD(0x036C, 0x00E0, 0, 0x0000, 0, 0),
++	MX6_PAD_ENET1_RX_ER__UART7_DCE_RTS                     = IOMUX_PAD(0x036C, 0x00E0, 1, 0x0650, 1, 0),
++	MX6_PAD_ENET1_RX_ER__UART7_DTE_CTS                     = IOMUX_PAD(0x036C, 0x00E0, 1, 0x0000, 0, 0),
++	MX6_PAD_ENET1_RX_ER__PWM8_OUT                          = IOMUX_PAD(0x036C, 0x00E0, 2, 0x0000, 0, 0),
++	MX6_PAD_ENET1_RX_ER__CSI_DATA23                        = IOMUX_PAD(0x036C, 0x00E0, 3, 0x0520, 0, 0),
++	MX6_PAD_ENET1_RX_ER__EIM_CRE                           = IOMUX_PAD(0x036C, 0x00E0, 4, 0x0000, 0, 0),
++	MX6_PAD_ENET1_RX_ER__GPIO2_IO07                        = IOMUX_PAD(0x036C, 0x00E0, 5, 0x0000, 0, 0),
++	MX6_PAD_ENET1_RX_ER__KPP_COL03                         = IOMUX_PAD(0x036C, 0x00E0, 6, 0x0000, 0, 0),
++	MX6_PAD_ENET1_RX_ER__GPT1_CAPTURE2                     = IOMUX_PAD(0x036C, 0x00E0, 8, 0x0590, 1, 0),
++
++	MX6_PAD_ENET2_RX_DATA0__ENET2_RDATA00                  = IOMUX_PAD(0x0370, 0x00E4, 0, 0x0000, 0, 0),
++	MX6_PAD_ENET2_RX_DATA0__UART6_DCE_TX                   = IOMUX_PAD(0x0370, 0x00E4, 1, 0x0000, 0, 0),
++	MX6_PAD_ENET2_RX_DATA0__UART6_DTE_RX                   = IOMUX_PAD(0x0370, 0x00E4, 1, 0x064C, 1, 0),
++	MX6_PAD_ENET2_RX_DATA0__SIM1_PORT0_TRXD                = IOMUX_PAD(0x0370, 0x00E4, 2, 0x0000, 0, 0),
++	MX6_PAD_ENET2_RX_DATA0__I2C3_SCL                       = IOMUX_PAD(0x0370, 0x00E4, IOMUX_CONFIG_SION | 3, 0x05B4, 1, 0),
++	MX6_PAD_ENET2_RX_DATA0__ENET1_MDIO                     = IOMUX_PAD(0x0370, 0x00E4, 4, 0x0578, 1, 0),
++	MX6_PAD_ENET2_RX_DATA0__GPIO2_IO08                     = IOMUX_PAD(0x0370, 0x00E4, 5, 0x0000, 0, 0),
++	MX6_PAD_ENET2_RX_DATA0__KPP_ROW04                      = IOMUX_PAD(0x0370, 0x00E4, 6, 0x0000, 0, 0),
++	MX6_PAD_ENET2_RX_DATA0__USB_OTG1_PWR                   = IOMUX_PAD(0x0370, 0x00E4, 8, 0x0000, 0, 0),
++	MX6_PAD_ENET2_RX_DATA0__EPDC_SDDO08                    = IOMUX_PAD(0x0370, 0x00E4, 9, 0x0000, 0, 0),
++
++	MX6_PAD_ENET2_RX_DATA1__ENET2_RDATA01                  = IOMUX_PAD(0x0374, 0x00E8, 0, 0x0000, 0, 0),
++	MX6_PAD_ENET2_RX_DATA1__UART6_DCE_RX                   = IOMUX_PAD(0x0374, 0x00E8, 1, 0x064C, 2, 0),
++	MX6_PAD_ENET2_RX_DATA1__UART6_DTE_TX                   = IOMUX_PAD(0x0374, 0x00E8, 1, 0x0000, 0, 0),
++	MX6_PAD_ENET2_RX_DATA1__SIM1_PORT0_CLK                 = IOMUX_PAD(0x0374, 0x00E8, 2, 0x0000, 0, 0),
++	MX6_PAD_ENET2_RX_DATA1__I2C3_SDA                       = IOMUX_PAD(0x0374, 0x00E8, IOMUX_CONFIG_SION | 3, 0x05B8, 1, 0),
++	MX6_PAD_ENET2_RX_DATA1__ENET1_MDC                      = IOMUX_PAD(0x0374, 0x00E8, 4, 0x0000, 0, 0),
++	MX6_PAD_ENET2_RX_DATA1__GPIO2_IO09                     = IOMUX_PAD(0x0374, 0x00E8, 5, 0x0000, 0, 0),
++	MX6_PAD_ENET2_RX_DATA1__KPP_COL04                      = IOMUX_PAD(0x0374, 0x00E8, 6, 0x0000, 0, 0),
++	MX6_PAD_ENET2_RX_DATA1__USB_OTG1_OC                    = IOMUX_PAD(0x0374, 0x00E8, 8, 0x0664, 1, 0),
++	MX6_PAD_ENET2_RX_DATA1__EPDC_SDDO09                    = IOMUX_PAD(0x0374, 0x00E8, 9, 0x0000, 0, 0),
++
++	MX6_PAD_ENET2_RX_EN__ENET2_RX_EN                       = IOMUX_PAD(0x0378, 0x00EC, 0, 0x0000, 0, 0),
++	MX6_PAD_ENET2_RX_EN__UART7_DCE_TX                      = IOMUX_PAD(0x0378, 0x00EC, 1, 0x0000, 0, 0),
++	MX6_PAD_ENET2_RX_EN__UART7_DTE_RX                      = IOMUX_PAD(0x0378, 0x00EC, 1, 0x0654, 0, 0),
++	MX6_PAD_ENET2_RX_EN__SIM1_PORT0_RST_B                  = IOMUX_PAD(0x0378, 0x00EC, 2, 0x0000, 0, 0),
++	MX6_PAD_ENET2_RX_EN__I2C4_SCL                          = IOMUX_PAD(0x0378, 0x00EC, IOMUX_CONFIG_SION | 3, 0x05BC, 1, 0),
++	MX6_PAD_ENET2_RX_EN__EIM_ADDR26                        = IOMUX_PAD(0x0378, 0x00EC, 4, 0x0000, 0, 0),
++	MX6_PAD_ENET2_RX_EN__GPIO2_IO10                        = IOMUX_PAD(0x0378, 0x00EC, 5, 0x0000, 0, 0),
++	MX6_PAD_ENET2_RX_EN__KPP_ROW05                         = IOMUX_PAD(0x0378, 0x00EC, 6, 0x0000, 0, 0),
++	MX6_PAD_ENET2_RX_EN__ENET1_REF_CLK_25M                 = IOMUX_PAD(0x0378, 0x00EC, 8, 0x0000, 0, 0),
++	MX6_PAD_ENET2_RX_EN__EPDC_SDDO10                       = IOMUX_PAD(0x0378, 0x00EC, 9, 0x0000, 0, 0),
++
++	MX6_PAD_ENET2_TX_DATA0__ENET2_TDATA00                  = IOMUX_PAD(0x037C, 0x00F0, 0, 0x0000, 0, 0),
++	MX6_PAD_ENET2_TX_DATA0__UART7_DCE_RX                   = IOMUX_PAD(0x037C, 0x00F0, 1, 0x0654, 1, 0),
++	MX6_PAD_ENET2_TX_DATA0__UART7_DTE_TX                   = IOMUX_PAD(0x037C, 0x00F0, 1, 0x0000, 0, 0),
++	MX6_PAD_ENET2_TX_DATA0__SIM1_PORT0_SVEN                = IOMUX_PAD(0x037C, 0x00F0, 2, 0x0000, 0, 0),
++	MX6_PAD_ENET2_TX_DATA0__I2C4_SDA                       = IOMUX_PAD(0x037C, 0x00F0, IOMUX_CONFIG_SION | 3, 0x05C0, 1, 0),
++	MX6_PAD_ENET2_TX_DATA0__EIM_EB_B02                     = IOMUX_PAD(0x037C, 0x00F0, 4, 0x0000, 0, 0),
++	MX6_PAD_ENET2_TX_DATA0__GPIO2_IO11                     = IOMUX_PAD(0x037C, 0x00F0, 5, 0x0000, 0, 0),
++	MX6_PAD_ENET2_TX_DATA0__KPP_COL05                      = IOMUX_PAD(0x037C, 0x00F0, 6, 0x0000, 0, 0),
++	MX6_PAD_ENET2_TX_DATA0__REF_CLK_24M                    = IOMUX_PAD(0x037C, 0x00F0, 8, 0x0000, 0, 0),
++	MX6_PAD_ENET2_TX_DATA0__EPDC_SDDO11                    = IOMUX_PAD(0x037C, 0x00F0, 9, 0x0000, 0, 0),
++
++	MX6_PAD_ENET2_TX_DATA1__ENET2_TDATA01                  = IOMUX_PAD(0x0380, 0x00F4, 0, 0x0000, 0, 0),
++	MX6_PAD_ENET2_TX_DATA1__UART8_DCE_TX                   = IOMUX_PAD(0x0380, 0x00F4, 1, 0x0000, 0, 0),
++	MX6_PAD_ENET2_TX_DATA1__UART8_DTE_RX                   = IOMUX_PAD(0x0380, 0x00F4, 1, 0x065C, 0, 0),
++	MX6_PAD_ENET2_TX_DATA1__SIM2_PORT0_TRXD                = IOMUX_PAD(0x0380, 0x00F4, 2, 0x0000, 0, 0),
++	MX6_PAD_ENET2_TX_DATA1__ECSPI4_SCLK                    = IOMUX_PAD(0x0380, 0x00F4, 3, 0x0564, 0, 0),
++	MX6_PAD_ENET2_TX_DATA1__EIM_EB_B03                     = IOMUX_PAD(0x0380, 0x00F4, 4, 0x0000, 0, 0),
++	MX6_PAD_ENET2_TX_DATA1__GPIO2_IO12                     = IOMUX_PAD(0x0380, 0x00F4, 5, 0x0000, 0, 0),
++	MX6_PAD_ENET2_TX_DATA1__KPP_ROW06                      = IOMUX_PAD(0x0380, 0x00F4, 6, 0x0000, 0, 0),
++	MX6_PAD_ENET2_TX_DATA1__USB_OTG2_PWR                   = IOMUX_PAD(0x0380, 0x00F4, 8, 0x0000, 0, 0),
++	MX6_PAD_ENET2_TX_DATA1__EPDC_SDDO12                    = IOMUX_PAD(0x0380, 0x00F4, 9, 0x0000, 0, 0),
++
++	MX6_PAD_ENET2_TX_EN__ENET2_TX_EN                       = IOMUX_PAD(0x0384, 0x00F8, 0, 0x0000, 0, 0),
++	MX6_PAD_ENET2_TX_EN__UART8_DCE_RX                      = IOMUX_PAD(0x0384, 0x00F8, 1, 0x065C, 1, 0),
++	MX6_PAD_ENET2_TX_EN__UART8_DTE_TX                      = IOMUX_PAD(0x0384, 0x00F8, 1, 0x0000, 0, 0),
++	MX6_PAD_ENET2_TX_EN__SIM2_PORT0_CLK                    = IOMUX_PAD(0x0384, 0x00F8, 2, 0x0000, 0, 0),
++	MX6_PAD_ENET2_TX_EN__ECSPI4_MOSI                       = IOMUX_PAD(0x0384, 0x00F8, 3, 0x056C, 0, 0),
++	MX6_PAD_ENET2_TX_EN__EIM_ACLK_FREERUN                  = IOMUX_PAD(0x0384, 0x00F8, 4, 0x0000, 0, 0),
++	MX6_PAD_ENET2_TX_EN__GPIO2_IO13                        = IOMUX_PAD(0x0384, 0x00F8, 5, 0x0000, 0, 0),
++	MX6_PAD_ENET2_TX_EN__KPP_COL06                         = IOMUX_PAD(0x0384, 0x00F8, 6, 0x0000, 0, 0),
++	MX6_PAD_ENET2_TX_EN__USB_OTG2_OC                       = IOMUX_PAD(0x0384, 0x00F8, 8, 0x0660, 1, 0),
++	MX6_PAD_ENET2_TX_EN__EPDC_SDDO13                       = IOMUX_PAD(0x0384, 0x00F8, 9, 0x0000, 0, 0),
++
++	MX6_PAD_ENET2_TX_CLK__ENET2_TX_CLK                     = IOMUX_PAD(0x0388, 0x00FC, IOMUX_CONFIG_SION | 0, 0x0000, 0, 0),
++	MX6_PAD_ENET2_TX_CLK__UART8_DCE_CTS                    = IOMUX_PAD(0x0388, 0x00FC, 1, 0x0000, 0, 0),
++	MX6_PAD_ENET2_TX_CLK__UART8_DTE_RTS                    = IOMUX_PAD(0x0388, 0x00FC, 1, 0x0658, 0, 0),
++	MX6_PAD_ENET2_TX_CLK__SIM2_PORT0_RST_B                 = IOMUX_PAD(0x0388, 0x00FC, 2, 0x0000, 0, 0),
++	MX6_PAD_ENET2_TX_CLK__ECSPI4_MISO                      = IOMUX_PAD(0x0388, 0x00FC, 3, 0x0568, 0, 0),
++	MX6_PAD_ENET2_TX_CLK__ENET2_REF_CLK2                   = IOMUX_PAD(0x0388, 0x00FC, IOMUX_CONFIG_SION | 4, 0x057C, 2, 0),
++	MX6_PAD_ENET2_TX_CLK__GPIO2_IO14                       = IOMUX_PAD(0x0388, 0x00FC, 5, 0x0000, 0, 0),
++	MX6_PAD_ENET2_TX_CLK__KPP_ROW07                        = IOMUX_PAD(0x0388, 0x00FC, 6, 0x0000, 0, 0),
++	MX6_PAD_ENET2_TX_CLK__ANATOP_OTG2_ID                   = IOMUX_PAD(0x0388, 0x00FC, 8, 0x04BC, 1, 0),
++	MX6_PAD_ENET2_TX_CLK__EPDC_SDDO14                      = IOMUX_PAD(0x0388, 0x00FC, 9, 0x0000, 0, 0),
++
++	MX6_PAD_ENET2_RX_ER__ENET2_RX_ER                       = IOMUX_PAD(0x038C, 0x0100, 0, 0x0000, 0, 0),
++	MX6_PAD_ENET2_RX_ER__UART8_DCE_RTS                     = IOMUX_PAD(0x038C, 0x0100, 1, 0x0658, 1, 0),
++	MX6_PAD_ENET2_RX_ER__UART8_DTE_CTS                     = IOMUX_PAD(0x038C, 0x0100, 1, 0x0000, 0, 0),
++	MX6_PAD_ENET2_RX_ER__SIM2_PORT0_SVEN                   = IOMUX_PAD(0x038C, 0x0100, 2, 0x0000, 0, 0),
++	MX6_PAD_ENET2_RX_ER__ECSPI4_SS0                        = IOMUX_PAD(0x038C, 0x0100, 3, 0x0570, 0, 0),
++	MX6_PAD_ENET2_RX_ER__EIM_ADDR25                        = IOMUX_PAD(0x038C, 0x0100, 4, 0x0000, 0, 0),
++	MX6_PAD_ENET2_RX_ER__GPIO2_IO15                        = IOMUX_PAD(0x038C, 0x0100, 5, 0x0000, 0, 0),
++	MX6_PAD_ENET2_RX_ER__KPP_COL07                         = IOMUX_PAD(0x038C, 0x0100, 6, 0x0000, 0, 0),
++	MX6_PAD_ENET2_RX_ER__WDOG1_WDOG_ANY                    = IOMUX_PAD(0x038C, 0x0100, 8, 0x0000, 0, 0),
++	MX6_PAD_ENET2_RX_ER__EPDC_SDDO15                       = IOMUX_PAD(0x038C, 0x0100, 9, 0x0000, 0, 0),
++
++	MX6_PAD_LCD_CLK__LCDIF_CLK                             = IOMUX_PAD(0x0390, 0x0104, 0, 0x0000, 0, 0),
++	MX6_PAD_LCD_CLK__LCDIF_WR_RWN                          = IOMUX_PAD(0x0390, 0x0104, 1, 0x0000, 0, 0),
++	MX6_PAD_LCD_CLK__UART4_DCE_TX                          = IOMUX_PAD(0x0390, 0x0104, 2, 0x0000, 0, 0),
++	MX6_PAD_LCD_CLK__UART4_DTE_RX                          = IOMUX_PAD(0x0390, 0x0104, 2, 0x063C, 2, 0),
++	MX6_PAD_LCD_CLK__SAI3_MCLK                             = IOMUX_PAD(0x0390, 0x0104, 3, 0x0600, 0, 0),
++	MX6_PAD_LCD_CLK__EIM_CS2_B                             = IOMUX_PAD(0x0390, 0x0104, 4, 0x0000, 0, 0),
++	MX6_PAD_LCD_CLK__GPIO3_IO00                            = IOMUX_PAD(0x0390, 0x0104, 5, 0x0000, 0, 0),
++	MX6_PAD_LCD_CLK__WDOG1_WDOG_RST_B_DEB                  = IOMUX_PAD(0x0390, 0x0104, 8, 0x0000, 0, 0),
++	MX6_PAD_LCD_CLK__EPDC_SDCLK                            = IOMUX_PAD(0x0390, 0x0104, 9, 0x0000, 0, 0),
++
++	MX6_PAD_LCD_ENABLE__LCDIF_ENABLE                       = IOMUX_PAD(0x0394, 0x0108, 0, 0x0000, 0, 0),
++	MX6_PAD_LCD_ENABLE__LCDIF_RD_E                         = IOMUX_PAD(0x0394, 0x0108, 1, 0x0000, 0, 0),
++	MX6_PAD_LCD_ENABLE__UART4_DCE_RX                       = IOMUX_PAD(0x0394, 0x0108, 2, 0x063C, 3, 0),
++	MX6_PAD_LCD_ENABLE__UART4_DTE_TX                       = IOMUX_PAD(0x0394, 0x0108, 2, 0x0000, 0, 0),
++	MX6_PAD_LCD_ENABLE__SAI3_TX_SYNC                       = IOMUX_PAD(0x0394, 0x0108, 3, 0x060C, 0, 0),
++	MX6_PAD_LCD_ENABLE__EIM_CS3_B                          = IOMUX_PAD(0x0394, 0x0108, 4, 0x0000, 0, 0),
++	MX6_PAD_LCD_ENABLE__GPIO3_IO01                         = IOMUX_PAD(0x0394, 0x0108, 5, 0x0000, 0, 0),
++	MX6_PAD_LCD_ENABLE__ECSPI2_RDY                         = IOMUX_PAD(0x0394, 0x0108, 8, 0x0000, 0, 0),
++	MX6_PAD_LCD_ENABLE__EPDC_SDLE                          = IOMUX_PAD(0x0394, 0x0108, 9, 0x0000, 0, 0),	
++
++	MX6_PAD_LCD_HSYNC__LCDIF_HSYNC                         = IOMUX_PAD(0x0398, 0x010C, 0, 0x05DC, 0, 0),
++	MX6_PAD_LCD_HSYNC__LCDIF_RS                            = IOMUX_PAD(0x0398, 0x010C, 1, 0x0000, 0, 0),
++	MX6_PAD_LCD_HSYNC__UART4_DCE_CTS                       = IOMUX_PAD(0x0398, 0x010C, 2, 0x0000, 0, 0),
++	MX6_PAD_LCD_HSYNC__UART4_DTE_RTS                       = IOMUX_PAD(0x0398, 0x010C, 2, 0x0638, 2, 0),
++	MX6_PAD_LCD_HSYNC__SAI3_TX_BCLK                        = IOMUX_PAD(0x0398, 0x010C, 3, 0x0608, 0, 0),
++	MX6_PAD_LCD_HSYNC__WDOG3_WDOG_RST_B_DEB                = IOMUX_PAD(0x0398, 0x010C, 4, 0x0000, 0, 0),
++	MX6_PAD_LCD_HSYNC__GPIO3_IO02                          = IOMUX_PAD(0x0398, 0x010C, 5, 0x0000, 0, 0),
++	MX6_PAD_LCD_HSYNC__ECSPI2_SS1                          = IOMUX_PAD(0x0398, 0x010C, 8, 0x0000, 0, 0),
++	MX6_PAD_LCD_HSYNC__EPDC_SDOE                           = IOMUX_PAD(0x0398, 0x010C, 9, 0x0000, 0, 0),
++
++	MX6_PAD_LCD_VSYNC__LCDIF_VSYNC                         = IOMUX_PAD(0x039C, 0x0110, 0, 0x0000, 0, 0),
++	MX6_PAD_LCD_VSYNC__LCDIF_BUSY                          = IOMUX_PAD(0x039C, 0x0110, 1, 0x05DC, 1, 0),
++	MX6_PAD_LCD_VSYNC__UART4_DCE_RTS                       = IOMUX_PAD(0x039C, 0x0110, 2, 0x0638, 3, 0),
++	MX6_PAD_LCD_VSYNC__UART4_DTE_CTS                       = IOMUX_PAD(0x039C, 0x0110, 2, 0x0000, 0, 0),
++	MX6_PAD_LCD_VSYNC__SAI3_RX_DATA                        = IOMUX_PAD(0x039C, 0x0110, 3, 0x0604, 0, 0),
++	MX6_PAD_LCD_VSYNC__WDOG2_WDOG_B                        = IOMUX_PAD(0x039C, 0x0110, 4, 0x0000, 0, 0),
++	MX6_PAD_LCD_VSYNC__GPIO3_IO03                          = IOMUX_PAD(0x039C, 0x0110, 5, 0x0000, 0, 0),
++	MX6_PAD_LCD_VSYNC__ECSPI2_SS2                          = IOMUX_PAD(0x039C, 0x0110, 8, 0x0000, 0, 0),
++	MX6_PAD_LCD_VSYNC__EPDC_SDCE0                          = IOMUX_PAD(0x039C, 0x0110, 9, 0x0000, 0, 0),
++
++	MX6_PAD_LCD_RESET__LCDIF_RESET                         = IOMUX_PAD(0x03A0, 0x0114, 0, 0x0000, 0, 0),
++	MX6_PAD_LCD_RESET__LCDIF_CS                            = IOMUX_PAD(0x03A0, 0x0114, 1, 0x0000, 0, 0),
++	MX6_PAD_LCD_RESET__CA7_MX6UL_EVENTI                    = IOMUX_PAD(0x03A0, 0x0114, 2, 0x0000, 0, 0),
++	MX6_PAD_LCD_RESET__SAI3_TX_DATA                        = IOMUX_PAD(0x03A0, 0x0114, 3, 0x0000, 0, 0),
++	MX6_PAD_LCD_RESET__WDOG1_WDOG_ANY                      = IOMUX_PAD(0x03A0, 0x0114, 4, 0x0000, 0, 0),
++	MX6_PAD_LCD_RESET__GPIO3_IO04                          = IOMUX_PAD(0x03A0, 0x0114, 5, 0x0000, 0, 0),
++	MX6_PAD_LCD_RESET__ECSPI2_SS3                          = IOMUX_PAD(0x03A0, 0x0114, 8, 0x0000, 0, 0),
++	MX6_PAD_LCD_RESET__EPDC_GDOE                           = IOMUX_PAD(0x03A0, 0x0114, 9, 0x0000, 0, 0),
++
++	MX6_PAD_LCD_DATA00__LCDIF_DATA00                       = IOMUX_PAD(0x03A4, 0x0118, 0, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA00__PWM1_OUT                           = IOMUX_PAD(0x03A4, 0x0118, 1, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA00__CA7_MX6UL_TRACE0                   = IOMUX_PAD(0x03A4, 0x0118, 2, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA00__ENET1_1588_EVENT2_IN               = IOMUX_PAD(0x03A4, 0x0118, 3, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA00__I2C3_SDA                           = IOMUX_PAD(0x03A4, 0x0118, IOMUX_CONFIG_SION | 4, 0x05B8, 2, 0),
++	MX6_PAD_LCD_DATA00__GPIO3_IO05                         = IOMUX_PAD(0x03A4, 0x0118, 5, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA00__SRC_BT_CFG00                       = IOMUX_PAD(0x03A4, 0x0118, 6, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA00__SAI1_MCLK                          = IOMUX_PAD(0x03A4, 0x0118, 8, 0x05E0, 1, 0),
++	MX6_PAD_LCD_DATA00__EPDC_SDDO00                        = IOMUX_PAD(0x03A4, 0x0118, 9, 0x0000, 0, 0),
++
++	MX6_PAD_LCD_DATA01__LCDIF_DATA01                       = IOMUX_PAD(0x03A8, 0x011C, 0, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA01__PWM2_OUT                           = IOMUX_PAD(0x03A8, 0x011C, 1, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA01__CA7_MX6UL_TRACE1                   = IOMUX_PAD(0x03A8, 0x011C, 2, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA01__ENET1_1588_EVENT2_OUT              = IOMUX_PAD(0x03A8, 0x011C, 3, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA01__I2C3_SCL                           = IOMUX_PAD(0x03A8, 0x011C, IOMUX_CONFIG_SION | 4, 0x05B4, 2, 0),
++	MX6_PAD_LCD_DATA01__GPIO3_IO06                         = IOMUX_PAD(0x03A8, 0x011C, 5, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA01__SRC_BT_CFG01                       = IOMUX_PAD(0x03A8, 0x011C, 6, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA01__SAI1_TX_SYNC                       = IOMUX_PAD(0x03A8, 0x011C, 8, 0x05EC, 0, 0),
++	MX6_PAD_LCD_DATA01__EPDC_SDDO01                        = IOMUX_PAD(0x03A8, 0x011C, 9, 0x0000, 0, 0),
++
++	MX6_PAD_LCD_DATA02__LCDIF_DATA02                       = IOMUX_PAD(0x03AC, 0x0120, 0, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA02__PWM3_OUT                           = IOMUX_PAD(0x03AC, 0x0120, 1, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA02__CA7_MX6UL_TRACE2                   = IOMUX_PAD(0x03AC, 0x0120, 2, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA02__ENET1_1588_EVENT3_IN               = IOMUX_PAD(0x03AC, 0x0120, 3, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA02__I2C4_SDA                           = IOMUX_PAD(0x03AC, 0x0120, IOMUX_CONFIG_SION | 4, 0x05C0, 2, 0),
++	MX6_PAD_LCD_DATA02__GPIO3_IO07                         = IOMUX_PAD(0x03AC, 0x0120, 5, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA02__SRC_BT_CFG02                       = IOMUX_PAD(0x03AC, 0x0120, 6, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA02__SAI1_TX_BCLK                       = IOMUX_PAD(0x03AC, 0x0120, 8, 0x05E8, 0, 0),
++	MX6_PAD_LCD_DATA02__EPDC_SDDO02                        = IOMUX_PAD(0x03AC, 0x0120, 9, 0x0000, 0, 0),
++
++	MX6_PAD_LCD_DATA03__LCDIF_DATA03                       = IOMUX_PAD(0x03B0, 0x0124, 0, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA03__PWM4_OUT                           = IOMUX_PAD(0x03B0, 0x0124, 1, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA03__CA7_MX6UL_TRACE3                   = IOMUX_PAD(0x03B0, 0x0124, 2, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA03__ENET1_1588_EVENT3_OUT              = IOMUX_PAD(0x03B0, 0x0124, 3, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA03__I2C4_SCL                           = IOMUX_PAD(0x03B0, 0x0124, IOMUX_CONFIG_SION | 4, 0x05BC, 2, 0),
++	MX6_PAD_LCD_DATA03__GPIO3_IO08                         = IOMUX_PAD(0x03B0, 0x0124, 5, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA03__SRC_BT_CFG03                       = IOMUX_PAD(0x03B0, 0x0124, 6, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA03__SAI1_RX_DATA                       = IOMUX_PAD(0x03B0, 0x0124, 8, 0x05E4, 0, 0),
++	MX6_PAD_LCD_DATA03__EPDC_SDDO03                        = IOMUX_PAD(0x03B0, 0x0124, 9, 0x0000, 0, 0),
++
++	MX6_PAD_LCD_DATA04__LCDIF_DATA04                       = IOMUX_PAD(0x03B4, 0x0128, 0, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA04__UART8_DCE_CTS                      = IOMUX_PAD(0x03B4, 0x0128, 1, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA04__UART8_DTE_RTS                      = IOMUX_PAD(0x03B4, 0x0128, 1, 0x0658, 2, 0),
++	MX6_PAD_LCD_DATA04__CA7_MX6UL_TRACE4                   = IOMUX_PAD(0x03B4, 0x0128, 2, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA04__ENET2_1588_EVENT2_IN               = IOMUX_PAD(0x03B4, 0x0128, 3, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA04__SPDIF_SR_CLK                       = IOMUX_PAD(0x03B4, 0x0128, 4, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA04__GPIO3_IO09                         = IOMUX_PAD(0x03B4, 0x0128, 5, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA04__SRC_BT_CFG04                       = IOMUX_PAD(0x03B4, 0x0128, 6, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA04__SAI1_TX_DATA                       = IOMUX_PAD(0x03B4, 0x0128, 8, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA04__EPDC_SDDO04                        = IOMUX_PAD(0x03B4, 0x0128, 9, 0x0000, 0, 0),
++
++	MX6_PAD_LCD_DATA05__LCDIF_DATA05                       = IOMUX_PAD(0x03B8, 0x012C, 0, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA05__UART8_DCE_RTS                      = IOMUX_PAD(0x03B8, 0x012C, 1, 0x0658, 3, 0),
++	MX6_PAD_LCD_DATA05__UART8_DTE_CTS                      = IOMUX_PAD(0x03B8, 0x012C, 1, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA05__CA7_MX6UL_TRACE5                   = IOMUX_PAD(0x03B8, 0x012C, 2, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA05__ENET2_1588_EVENT2_OUT              = IOMUX_PAD(0x03B8, 0x012C, 3, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA05__SPDIF_OUT                          = IOMUX_PAD(0x03B8, 0x012C, 4, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA05__GPIO3_IO10                         = IOMUX_PAD(0x03B8, 0x012C, 5, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA05__SRC_BT_CFG05                       = IOMUX_PAD(0x03B8, 0x012C, 6, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA05__ECSPI1_SS1                         = IOMUX_PAD(0x03B8, 0x012C, 8, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA05__EPDC_SDDO05                        = IOMUX_PAD(0x03B8, 0x012C, 9, 0x0000, 0, 0),
++
++	MX6_PAD_LCD_DATA06__LCDIF_DATA06                       = IOMUX_PAD(0x03BC, 0x0130, 0, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA06__UART7_DCE_CTS                      = IOMUX_PAD(0x03BC, 0x0130, 1, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA06__UART7_DTE_RTS                      = IOMUX_PAD(0x03BC, 0x0130, 1, 0x0650, 2, 0),
++	MX6_PAD_LCD_DATA06__CA7_MX6UL_TRACE6                   = IOMUX_PAD(0x03BC, 0x0130, 2, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA06__ENET2_1588_EVENT3_IN               = IOMUX_PAD(0x03BC, 0x0130, 3, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA06__SPDIF_LOCK                         = IOMUX_PAD(0x03BC, 0x0130, 4, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA06__GPIO3_IO11                         = IOMUX_PAD(0x03BC, 0x0130, 5, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA06__SRC_BT_CFG06                       = IOMUX_PAD(0x03BC, 0x0130, 6, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA06__ECSPI1_SS2                         = IOMUX_PAD(0x03BC, 0x0130, 8, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA06__EPDC_SDDO06                        = IOMUX_PAD(0x03BC, 0x0130, 9, 0x0000, 0, 0),
++
++	MX6_PAD_LCD_DATA07__LCDIF_DATA07                       = IOMUX_PAD(0x03C0, 0x0134, 0, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA07__UART7_DCE_RTS                      = IOMUX_PAD(0x03C0, 0x0134, 1, 0x0650, 3, 0),
++	MX6_PAD_LCD_DATA07__UART7_DTE_CTS                      = IOMUX_PAD(0x03C0, 0x0134, 1, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA07__CA7_MX6UL_TRACE7                   = IOMUX_PAD(0x03C0, 0x0134, 2, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA07__ENET2_1588_EVENT3_OUT              = IOMUX_PAD(0x03C0, 0x0134, 3, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA07__SPDIF_EXT_CLK                      = IOMUX_PAD(0x03C0, 0x0134, 4, 0x061C, 0, 0),
++	MX6_PAD_LCD_DATA07__GPIO3_IO12                         = IOMUX_PAD(0x03C0, 0x0134, 5, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA07__SRC_BT_CFG07                       = IOMUX_PAD(0x03C0, 0x0134, 6, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA07__ECSPI1_SS3                         = IOMUX_PAD(0x03C0, 0x0134, 8, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA07__EPDC_SDDO07                        = IOMUX_PAD(0x03C0, 0x0134, 9, 0x0000, 0, 0),
++
++	MX6_PAD_LCD_DATA08__LCDIF_DATA08                       = IOMUX_PAD(0x03C4, 0x0138, 0, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA08__SPDIF_IN                           = IOMUX_PAD(0x03C4, 0x0138, 1, 0x0618, 2, 0),
++	MX6_PAD_LCD_DATA08__CA7_MX6UL_TRACE8                   = IOMUX_PAD(0x03C4, 0x0138, 2, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA08__CSI_DATA16                         = IOMUX_PAD(0x03C4, 0x0138, 3, 0x0504, 1, 0),
++	MX6_PAD_LCD_DATA08__EIM_DATA00                         = IOMUX_PAD(0x03C4, 0x0138, 4, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA08__GPIO3_IO13                         = IOMUX_PAD(0x03C4, 0x0138, 5, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA08__SRC_BT_CFG08                       = IOMUX_PAD(0x03C4, 0x0138, 6, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA08__FLEXCAN1_TX                        = IOMUX_PAD(0x03C4, 0x0138, 8, 0x0000, 0, 0),
++
++	MX6_PAD_LCD_DATA09__LCDIF_DATA09                       = IOMUX_PAD(0x03C8, 0x013C, 0, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA09__SAI3_MCLK                          = IOMUX_PAD(0x03C8, 0x013C, 1, 0x0600, 1, 0),
++	MX6_PAD_LCD_DATA09__CA7_MX6UL_TRACE9                   = IOMUX_PAD(0x03C8, 0x013C, 2, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA09__CSI_DATA17                         = IOMUX_PAD(0x03C8, 0x013C, 3, 0x0508, 1, 0),
++	MX6_PAD_LCD_DATA09__EIM_DATA01                         = IOMUX_PAD(0x03C8, 0x013C, 4, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA09__GPIO3_IO14                         = IOMUX_PAD(0x03C8, 0x013C, 5, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA09__SRC_BT_CFG09                       = IOMUX_PAD(0x03C8, 0x013C, 6, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA09__FLEXCAN1_RX                        = IOMUX_PAD(0x03C8, 0x013C, 8, 0x0584, 2, 0),
++
++	MX6_PAD_LCD_DATA10__LCDIF_DATA10                       = IOMUX_PAD(0x03CC, 0x0140, 0, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA10__SAI3_RX_SYNC                       = IOMUX_PAD(0x03CC, 0x0140, 1, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA10__CA7_MX6UL_TRACE10                  = IOMUX_PAD(0x03CC, 0x0140, 2, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA10__CSI_DATA18                         = IOMUX_PAD(0x03CC, 0x0140, 3, 0x050C, 1, 0),
++	MX6_PAD_LCD_DATA10__EIM_DATA02                         = IOMUX_PAD(0x03CC, 0x0140, 4, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA10__GPIO3_IO15                         = IOMUX_PAD(0x03CC, 0x0140, 5, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA10__SRC_BT_CFG10                       = IOMUX_PAD(0x03CC, 0x0140, 6, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA10__FLEXCAN2_TX                        = IOMUX_PAD(0x03CC, 0x0140, 8, 0x0000, 0, 0),
++
++	MX6_PAD_LCD_DATA11__LCDIF_DATA11                       = IOMUX_PAD(0x03D0, 0x0144, 0, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA11__SAI3_RX_BCLK                       = IOMUX_PAD(0x03D0, 0x0144, 1, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA11__CA7_MX6UL_TRACE11                  = IOMUX_PAD(0x03D0, 0x0144, 2, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA11__CSI_DATA19                         = IOMUX_PAD(0x03D0, 0x0144, 3, 0x0510, 1, 0),
++	MX6_PAD_LCD_DATA11__EIM_DATA03                         = IOMUX_PAD(0x03D0, 0x0144, 4, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA11__GPIO3_IO16                         = IOMUX_PAD(0x03D0, 0x0144, 5, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA11__SRC_BT_CFG11                       = IOMUX_PAD(0x03D0, 0x0144, 6, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA11__FLEXCAN2_RX                        = IOMUX_PAD(0x03D0, 0x0144, 8, 0x0588, 2, 0),
++
++	MX6_PAD_LCD_DATA12__LCDIF_DATA12                       = IOMUX_PAD(0x03D4, 0x0148, 0, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA12__SAI3_TX_SYNC                       = IOMUX_PAD(0x03D4, 0x0148, 1, 0x060C, 1, 0),
++	MX6_PAD_LCD_DATA12__CA7_MX6UL_TRACE12                  = IOMUX_PAD(0x03D4, 0x0148, 2, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA12__CSI_DATA20                         = IOMUX_PAD(0x03D4, 0x0148, 3, 0x0514, 1, 0),
++	MX6_PAD_LCD_DATA12__EIM_DATA04                         = IOMUX_PAD(0x03D4, 0x0148, 4, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA12__GPIO3_IO17                         = IOMUX_PAD(0x03D4, 0x0148, 5, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA12__SRC_BT_CFG12                       = IOMUX_PAD(0x03D4, 0x0148, 6, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA12__ECSPI1_RDY                         = IOMUX_PAD(0x03D4, 0x0148, 8, 0x0000, 0, 0),
++
++	MX6_PAD_LCD_DATA13__LCDIF_DATA13                       = IOMUX_PAD(0x03D8, 0x014C, 0, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA13__SAI3_TX_BCLK                       = IOMUX_PAD(0x03D8, 0x014C, 1, 0x0608, 1, 0),
++	MX6_PAD_LCD_DATA13__CA7_MX6UL_TRACE13                  = IOMUX_PAD(0x03D8, 0x014C, 2, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA13__CSI_DATA21                         = IOMUX_PAD(0x03D8, 0x014C, 3, 0x0518, 1, 0),
++	MX6_PAD_LCD_DATA13__EIM_DATA05                         = IOMUX_PAD(0x03D8, 0x014C, 4, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA13__GPIO3_IO18                         = IOMUX_PAD(0x03D8, 0x014C, 5, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA13__SRC_BT_CFG13                       = IOMUX_PAD(0x03D8, 0x014C, 6, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA13__USDHC2_RESET_B                     = IOMUX_PAD(0x03D8, 0x014C, 8, 0x0000, 0, 0),
++
++	MX6_PAD_LCD_DATA14__LCDIF_DATA14                       = IOMUX_PAD(0x03DC, 0x0150, 0, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA14__SAI3_RX_DATA                       = IOMUX_PAD(0x03DC, 0x0150, 1, 0x0604, 1, 0),
++	MX6_PAD_LCD_DATA14__CA7_MX6UL_TRACE14                  = IOMUX_PAD(0x03DC, 0x0150, 2, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA14__CSI_DATA22                         = IOMUX_PAD(0x03DC, 0x0150, 3, 0x051C, 1, 0),
++	MX6_PAD_LCD_DATA14__EIM_DATA06                         = IOMUX_PAD(0x03DC, 0x0150, 4, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA14__GPIO3_IO19                         = IOMUX_PAD(0x03DC, 0x0150, 5, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA14__SRC_BT_CFG14                       = IOMUX_PAD(0x03DC, 0x0150, 6, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA14__USDHC2_DATA4                       = IOMUX_PAD(0x03DC, 0x0150, 8, 0x068C, 0, 0),
++	MX6_PAD_LCD_DATA14__EPDC_SDSHR                        = IOMUX_PAD(0x03DC, 0x0150, 9, 0x0000, 0, 0),
++
++	MX6_PAD_LCD_DATA15__LCDIF_DATA15                       = IOMUX_PAD(0x03E0, 0x0154, 0, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA15__SAI3_TX_DATA                       = IOMUX_PAD(0x03E0, 0x0154, 1, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA15__CA7_MX6UL_TRACE15                  = IOMUX_PAD(0x03E0, 0x0154, 2, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA15__CSI_DATA23                         = IOMUX_PAD(0x03E0, 0x0154, 3, 0x0520, 1, 0),
++	MX6_PAD_LCD_DATA15__EIM_DATA07                         = IOMUX_PAD(0x03E0, 0x0154, 4, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA15__GPIO3_IO20                         = IOMUX_PAD(0x03E0, 0x0154, 5, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA15__SRC_BT_CFG15                       = IOMUX_PAD(0x03E0, 0x0154, 6, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA15__USDHC2_DATA5                       = IOMUX_PAD(0x03E0, 0x0154, 8, 0x0690, 0, 0),
++	MX6_PAD_LCD_DATA15__EPDC_GDRL                         = IOMUX_PAD(0x03E0, 0x0154, 9, 0x0000, 0, 0),
++
++	MX6_PAD_LCD_DATA16__LCDIF_DATA16                       = IOMUX_PAD(0x03E4, 0x0158, 0, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA16__UART7_DCE_TX                       = IOMUX_PAD(0x03E4, 0x0158, 1, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA16__UART7_DTE_RX                       = IOMUX_PAD(0x03E4, 0x0158, 1, 0x0654, 2, 0),
++	MX6_PAD_LCD_DATA16__CA7_MX6UL_TRACE_CLK                = IOMUX_PAD(0x03E4, 0x0158, 2, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA16__CSI_DATA01                         = IOMUX_PAD(0x03E4, 0x0158, 3, 0x04D4, 1, 0),
++	MX6_PAD_LCD_DATA16__EIM_DATA08                         = IOMUX_PAD(0x03E4, 0x0158, 4, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA16__GPIO3_IO21                         = IOMUX_PAD(0x03E4, 0x0158, 5, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA16__SRC_BT_CFG24                       = IOMUX_PAD(0x03E4, 0x0158, 6, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA16__USDHC2_DATA6                       = IOMUX_PAD(0x03E4, 0x0158, 8, 0x0694, 0, 0),
++	MX6_PAD_LCD_DATA16__EPDC_GDCLK                        = IOMUX_PAD(0x03E4, 0x0158, 9, 0x0000, 0, 0),
++
++	MX6_PAD_LCD_DATA17__LCDIF_DATA17                       = IOMUX_PAD(0x03E8, 0x015C, 0, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA17__UART7_DCE_RX                       = IOMUX_PAD(0x03E8, 0x015C, 1, 0x0654, 3, 0),
++	MX6_PAD_LCD_DATA17__UART7_DTE_TX                       = IOMUX_PAD(0x03E8, 0x015C, 1, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA17__CA7_MX6UL_TRACE_CTL                = IOMUX_PAD(0x03E8, 0x015C, 2, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA17__CSI_DATA00                         = IOMUX_PAD(0x03E8, 0x015C, 3, 0x04D0, 1, 0),
++	MX6_PAD_LCD_DATA17__EIM_DATA09                         = IOMUX_PAD(0x03E8, 0x015C, 4, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA17__GPIO3_IO22                         = IOMUX_PAD(0x03E8, 0x015C, 5, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA17__SRC_BT_CFG25                       = IOMUX_PAD(0x03E8, 0x015C, 6, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA17__USDHC2_DATA7                       = IOMUX_PAD(0x03E8, 0x015C, 8, 0x0698, 0, 0),
++	MX6_PAD_LCD_DATA17__EPDC_GDSP                         = IOMUX_PAD(0x03E8, 0x015C, 9, 0x0000, 0, 0),
++
++	MX6_PAD_LCD_DATA18__LCDIF_DATA18                       = IOMUX_PAD(0x03EC, 0x0160, 0, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA18__PWM5_OUT                           = IOMUX_PAD(0x03EC, 0x0160, 1, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA18__CA7_MX6UL_EVENTO                   = IOMUX_PAD(0x03EC, 0x0160, 2, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA18__CA7_MX6ULL_EVENTO                 = IOMUX_PAD(0x03EC, 0x0160, 2, 0x0000, 0, 0),	
++	MX6_PAD_LCD_DATA18__CSI_DATA10                         = IOMUX_PAD(0x03EC, 0x0160, 3, 0x04EC, 1, 0),
++	MX6_PAD_LCD_DATA18__EIM_DATA10                         = IOMUX_PAD(0x03EC, 0x0160, 4, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA18__GPIO3_IO23                         = IOMUX_PAD(0x03EC, 0x0160, 5, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA18__SRC_BT_CFG26                       = IOMUX_PAD(0x03EC, 0x0160, 6, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA18__USDHC2_CMD                         = IOMUX_PAD(0x03EC, 0x0160, 8, 0x0678, 1, 0),
++	MX6_PAD_LCD_DATA19__EIM_DATA11                         = IOMUX_PAD(0x03F0, 0x0164, 4, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA19__GPIO3_IO24                         = IOMUX_PAD(0x03F0, 0x0164, 5, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA19__SRC_BT_CFG27                       = IOMUX_PAD(0x03F0, 0x0164, 6, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA19__USDHC2_CLK                         = IOMUX_PAD(0x03F0, 0x0164, 8, 0x0670, 1, 0),
++
++	MX6_PAD_LCD_DATA19__LCDIF_DATA19                       = IOMUX_PAD(0x03F0, 0x0164, 0, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA19__PWM6_OUT                           = IOMUX_PAD(0x03F0, 0x0164, 1, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA19__WDOG1_WDOG_ANY                     = IOMUX_PAD(0x03F0, 0x0164, 2, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA19__CSI_DATA11                         = IOMUX_PAD(0x03F0, 0x0164, 3, 0x04F0, 1, 0),
++	MX6_PAD_LCD_DATA20__EIM_DATA12                         = IOMUX_PAD(0x03F4, 0x0168, 4, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA20__GPIO3_IO25                         = IOMUX_PAD(0x03F4, 0x0168, 5, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA20__SRC_BT_CFG28                       = IOMUX_PAD(0x03F4, 0x0168, 6, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA20__USDHC2_DATA0                       = IOMUX_PAD(0x03F4, 0x0168, 8, 0x067C, 1, 0),
++
++	MX6_PAD_LCD_DATA20__LCDIF_DATA20                       = IOMUX_PAD(0x03F4, 0x0168, 0, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA20__UART8_DCE_TX                       = IOMUX_PAD(0x03F4, 0x0168, 1, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA20__UART8_DTE_RX                       = IOMUX_PAD(0x03F4, 0x0168, 1, 0x065C, 2, 0),
++	MX6_PAD_LCD_DATA20__ECSPI1_SCLK                        = IOMUX_PAD(0x03F4, 0x0168, 2, 0x0534, 0, 0),
++	MX6_PAD_LCD_DATA20__CSI_DATA12                         = IOMUX_PAD(0x03F4, 0x0168, 3, 0x04F4, 1, 0),
++
++	MX6_PAD_LCD_DATA21__LCDIF_DATA21                       = IOMUX_PAD(0x03F8, 0x016C, 0, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA21__UART8_DCE_RX                       = IOMUX_PAD(0x03F8, 0x016C, 1, 0x065C, 3, 0),
++	MX6_PAD_LCD_DATA21__UART8_DTE_TX                       = IOMUX_PAD(0x03F8, 0x016C, 1, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA21__ECSPI1_SS0                         = IOMUX_PAD(0x03F8, 0x016C, 2, 0x0540, 0, 0),
++	MX6_PAD_LCD_DATA21__CSI_DATA13                         = IOMUX_PAD(0x03F8, 0x016C, 3, 0x04F8, 1, 0),
++	MX6_PAD_LCD_DATA21__EIM_DATA13                         = IOMUX_PAD(0x03F8, 0x016C, 4, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA21__GPIO3_IO26                         = IOMUX_PAD(0x03F8, 0x016C, 5, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA21__SRC_BT_CFG29                       = IOMUX_PAD(0x03F8, 0x016C, 6, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA21__USDHC2_DATA1                       = IOMUX_PAD(0x03F8, 0x016C, 8, 0x0680, 1, 0),
++	MX6_PAD_LCD_DATA21__EPDC_SDCE1                         = IOMUX_PAD(0x03F8, 0x016C, 9, 0x0000, 0, 0),
++
++	MX6_PAD_LCD_DATA22__LCDIF_DATA22                       = IOMUX_PAD(0x03FC, 0x0170, 0, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA22__MQS_RIGHT                          = IOMUX_PAD(0x03FC, 0x0170, 1, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA22__ECSPI1_MOSI                        = IOMUX_PAD(0x03FC, 0x0170, 2, 0x053C, 0, 0),
++	MX6_PAD_LCD_DATA22__CSI_DATA14                         = IOMUX_PAD(0x03FC, 0x0170, 3, 0x04FC, 1, 0),
++	MX6_PAD_LCD_DATA22__EIM_DATA14                         = IOMUX_PAD(0x03FC, 0x0170, 4, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA22__GPIO3_IO27                         = IOMUX_PAD(0x03FC, 0x0170, 5, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA22__SRC_BT_CFG30                       = IOMUX_PAD(0x03FC, 0x0170, 6, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA22__USDHC2_DATA2                       = IOMUX_PAD(0x03FC, 0x0170, 8, 0x0684, 0, 0),
++
++	MX6_PAD_LCD_DATA23__LCDIF_DATA23                       = IOMUX_PAD(0x0400, 0x0174, 0, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA23__MQS_LEFT                           = IOMUX_PAD(0x0400, 0x0174, 1, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA23__ECSPI1_MISO                        = IOMUX_PAD(0x0400, 0x0174, 2, 0x0538, 0, 0),
++	MX6_PAD_LCD_DATA23__CSI_DATA15                         = IOMUX_PAD(0x0400, 0x0174, 3, 0x0500, 1, 0),
++	MX6_PAD_LCD_DATA23__EIM_DATA15                         = IOMUX_PAD(0x0400, 0x0174, 4, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA23__GPIO3_IO28                         = IOMUX_PAD(0x0400, 0x0174, 5, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA23__SRC_BT_CFG31                       = IOMUX_PAD(0x0400, 0x0174, 6, 0x0000, 0, 0),
++	MX6_PAD_LCD_DATA23__USDHC2_DATA3                       = IOMUX_PAD(0x0400, 0x0174, 8, 0x0688, 1, 0),
++
++	MX6_PAD_NAND_RE_B__RAWNAND_RE_B                        = IOMUX_PAD(0x0404, 0x0178, 0, 0x0000, 0, 0),
++	MX6_PAD_NAND_RE_B__USDHC2_CLK                          = IOMUX_PAD(0x0404, 0x0178, 1, 0x0670, 2, 0),
++	MX6_PAD_NAND_RE_B__QSPI_B_SCLK                         = IOMUX_PAD(0x0404, 0x0178, 2, 0x0000, 0, 0),
++	MX6_PAD_NAND_RE_B__KPP_ROW00                           = IOMUX_PAD(0x0404, 0x0178, 3, 0x05D0, 1, 0),
++	MX6_PAD_NAND_RE_B__EIM_EB_B00                          = IOMUX_PAD(0x0404, 0x0178, 4, 0x0000, 0, 0),
++	MX6_PAD_NAND_RE_B__GPIO4_IO00                          = IOMUX_PAD(0x0404, 0x0178, 5, 0x0000, 0, 0),
++	MX6_PAD_NAND_RE_B__ECSPI3_SS2                          = IOMUX_PAD(0x0404, 0x0178, 8, 0x0000, 0, 0),
++
++	MX6_PAD_NAND_WE_B__RAWNAND_WE_B                        = IOMUX_PAD(0x0408, 0x017C, 0, 0x0000, 0, 0),
++	MX6_PAD_NAND_WE_B__USDHC2_CMD                          = IOMUX_PAD(0x0408, 0x017C, 1, 0x0678, 2, 0),
++	MX6_PAD_NAND_WE_B__QSPI_B_SS0_B                        = IOMUX_PAD(0x0408, 0x017C, 2, 0x0000, 0, 0),
++	MX6_PAD_NAND_WE_B__KPP_COL00                           = IOMUX_PAD(0x0408, 0x017C, 3, 0x05C4, 1, 0),
++	MX6_PAD_NAND_WE_B__EIM_EB_B01                          = IOMUX_PAD(0x0408, 0x017C, 4, 0x0000, 0, 0),
++	MX6_PAD_NAND_WE_B__GPIO4_IO01                          = IOMUX_PAD(0x0408, 0x017C, 5, 0x0000, 0, 0),
++	MX6_PAD_NAND_WE_B__ECSPI3_SS3                          = IOMUX_PAD(0x0408, 0x017C, 8, 0x0000, 0, 0),
++
++	MX6_PAD_NAND_DATA00__RAWNAND_DATA00                    = IOMUX_PAD(0x040C, 0x0180, 0, 0x0000, 0, 0),
++	MX6_PAD_NAND_DATA00__USDHC2_DATA0                      = IOMUX_PAD(0x040C, 0x0180, 1, 0x067C, 2, 0),
++	MX6_PAD_NAND_DATA00__QSPI_B_SS1_B                      = IOMUX_PAD(0x040C, 0x0180, 2, 0x0000, 0, 0),
++	MX6_PAD_NAND_DATA00__KPP_ROW01                         = IOMUX_PAD(0x040C, 0x0180, 3, 0x05D4, 1, 0),
++	MX6_PAD_NAND_DATA00__EIM_AD08                          = IOMUX_PAD(0x040C, 0x0180, 4, 0x0000, 0, 0),
++	MX6_PAD_NAND_DATA00__GPIO4_IO02                        = IOMUX_PAD(0x040C, 0x0180, 5, 0x0000, 0, 0),
++	MX6_PAD_NAND_DATA00__ECSPI4_RDY                        = IOMUX_PAD(0x040C, 0x0180, 8, 0x0000, 0, 0),
++
++	MX6_PAD_NAND_DATA01__RAWNAND_DATA01                    = IOMUX_PAD(0x0410, 0x0184, 0, 0x0000, 0, 0),
++	MX6_PAD_NAND_DATA01__USDHC2_DATA1                      = IOMUX_PAD(0x0410, 0x0184, 1, 0x0680, 2, 0),
++	MX6_PAD_NAND_DATA01__QSPI_B_DQS                        = IOMUX_PAD(0x0410, 0x0184, 2, 0x0000, 0, 0),
++	MX6_PAD_NAND_DATA01__KPP_COL01                         = IOMUX_PAD(0x0410, 0x0184, 3, 0x05C8, 1, 0),
++	MX6_PAD_NAND_DATA01__EIM_AD09                          = IOMUX_PAD(0x0410, 0x0184, 4, 0x0000, 0, 0),
++	MX6_PAD_NAND_DATA01__GPIO4_IO03                        = IOMUX_PAD(0x0410, 0x0184, 5, 0x0000, 0, 0),
++	MX6_PAD_NAND_DATA01__ECSPI4_SS1                        = IOMUX_PAD(0x0410, 0x0184, 8, 0x0000, 0, 0),
++
++	MX6_PAD_NAND_DATA02__RAWNAND_DATA02                    = IOMUX_PAD(0x0414, 0x0188, 0, 0x0000, 0, 0),
++	MX6_PAD_NAND_DATA02__USDHC2_DATA2                      = IOMUX_PAD(0x0414, 0x0188, 1, 0x0684, 1, 0),
++	MX6_PAD_NAND_DATA02__QSPI_B_DATA00                     = IOMUX_PAD(0x0414, 0x0188, 2, 0x0000, 0, 0),
++	MX6_PAD_NAND_DATA02__KPP_ROW02                         = IOMUX_PAD(0x0414, 0x0188, 3, 0x05D8, 1, 0),
++	MX6_PAD_NAND_DATA02__EIM_AD10                          = IOMUX_PAD(0x0414, 0x0188, 4, 0x0000, 0, 0),
++	MX6_PAD_NAND_DATA02__GPIO4_IO04                        = IOMUX_PAD(0x0414, 0x0188, 5, 0x0000, 0, 0),
++	MX6_PAD_NAND_DATA02__ECSPI4_SS2                        = IOMUX_PAD(0x0414, 0x0188, 8, 0x0000, 0, 0),
++
++	MX6_PAD_NAND_DATA03__RAWNAND_DATA03                    = IOMUX_PAD(0x0418, 0x018C, 0, 0x0000, 0, 0),
++	MX6_PAD_NAND_DATA03__USDHC2_DATA3                      = IOMUX_PAD(0x0418, 0x018C, 1, 0x0688, 2, 0),
++	MX6_PAD_NAND_DATA03__QSPI_B_DATA01                     = IOMUX_PAD(0x0418, 0x018C, 2, 0x0000, 0, 0),
++	MX6_PAD_NAND_DATA03__KPP_COL02                         = IOMUX_PAD(0x0418, 0x018C, 3, 0x05CC, 1, 0),
++	MX6_PAD_NAND_DATA03__EIM_AD11                          = IOMUX_PAD(0x0418, 0x018C, 4, 0x0000, 0, 0),
++	MX6_PAD_NAND_DATA03__GPIO4_IO05                        = IOMUX_PAD(0x0418, 0x018C, 5, 0x0000, 0, 0),
++	MX6_PAD_NAND_DATA03__ECSPI4_SS3                        = IOMUX_PAD(0x0418, 0x018C, 8, 0x0000, 0, 0),
++
++	MX6_PAD_NAND_DATA04__RAWNAND_DATA04                    = IOMUX_PAD(0x041C, 0x0190, 0, 0x0000, 0, 0),
++	MX6_PAD_NAND_DATA04__USDHC2_DATA4                      = IOMUX_PAD(0x041C, 0x0190, 1, 0x068C, 1, 0),
++	MX6_PAD_NAND_DATA04__QSPI_B_DATA02                     = IOMUX_PAD(0x041C, 0x0190, 2, 0x0000, 0, 0),
++	MX6_PAD_NAND_DATA04__ECSPI4_SCLK                       = IOMUX_PAD(0x041C, 0x0190, 3, 0x0564, 1, 0),
++	MX6_PAD_NAND_DATA04__EIM_AD12                          = IOMUX_PAD(0x041C, 0x0190, 4, 0x0000, 0, 0),
++	MX6_PAD_NAND_DATA04__GPIO4_IO06                        = IOMUX_PAD(0x041C, 0x0190, 5, 0x0000, 0, 0),
++	MX6_PAD_NAND_DATA04__UART2_DCE_TX                      = IOMUX_PAD(0x041C, 0x0190, 8, 0x0000, 0, 0),
++	MX6_PAD_NAND_DATA04__UART2_DTE_RX                      = IOMUX_PAD(0x041C, 0x0190, 8, 0x062C, 2, 0),
++
++	MX6_PAD_NAND_DATA05__RAWNAND_DATA05                    = IOMUX_PAD(0x0420, 0x0194, 0, 0x0000, 0, 0),
++	MX6_PAD_NAND_DATA05__USDHC2_DATA5                      = IOMUX_PAD(0x0420, 0x0194, 1, 0x0690, 1, 0),
++	MX6_PAD_NAND_DATA05__QSPI_B_DATA03                     = IOMUX_PAD(0x0420, 0x0194, 2, 0x0000, 0, 0),
++	MX6_PAD_NAND_DATA05__ECSPI4_MOSI                       = IOMUX_PAD(0x0420, 0x0194, 3, 0x056C, 1, 0),
++	MX6_PAD_NAND_DATA05__EIM_AD13                          = IOMUX_PAD(0x0420, 0x0194, 4, 0x0000, 0, 0),
++	MX6_PAD_NAND_DATA05__GPIO4_IO07                        = IOMUX_PAD(0x0420, 0x0194, 5, 0x0000, 0, 0),
++	MX6_PAD_NAND_DATA05__UART2_DCE_RX                      = IOMUX_PAD(0x0420, 0x0194, 8, 0x062C, 3, 0),
++	MX6_PAD_NAND_DATA05__UART2_DTE_TX                      = IOMUX_PAD(0x0420, 0x0194, 8, 0x0000, 0, 0),
++
++	MX6_PAD_NAND_DATA06__RAWNAND_DATA06                    = IOMUX_PAD(0x0424, 0x0198, 0, 0x0000, 0, 0),
++	MX6_PAD_NAND_DATA06__USDHC2_DATA6                      = IOMUX_PAD(0x0424, 0x0198, 1, 0x0694, 1, 0),
++	MX6_PAD_NAND_DATA06__SAI2_RX_BCLK                      = IOMUX_PAD(0x0424, 0x0198, 2, 0x0000, 0, 0),
++	MX6_PAD_NAND_DATA06__ECSPI4_MISO                       = IOMUX_PAD(0x0424, 0x0198, 3, 0x0568, 1, 0),
++	MX6_PAD_NAND_DATA06__EIM_AD14                          = IOMUX_PAD(0x0424, 0x0198, 4, 0x0000, 0, 0),
++	MX6_PAD_NAND_DATA06__GPIO4_IO08                        = IOMUX_PAD(0x0424, 0x0198, 5, 0x0000, 0, 0),
++	MX6_PAD_NAND_DATA06__UART2_DCE_CTS                     = IOMUX_PAD(0x0424, 0x0198, 8, 0x0000, 0, 0),
++	MX6_PAD_NAND_DATA06__UART2_DTE_RTS                     = IOMUX_PAD(0x0424, 0x0198, 8, 0x0628, 4, 0),
++
++	MX6_PAD_NAND_DATA07__RAWNAND_DATA07                    = IOMUX_PAD(0x0428, 0x019C, 0, 0x0000, 0, 0),
++	MX6_PAD_NAND_DATA07__USDHC2_DATA7                      = IOMUX_PAD(0x0428, 0x019C, 1, 0x0698, 1, 0),
++	MX6_PAD_NAND_DATA07__QSPI_A_SS1_B                      = IOMUX_PAD(0x0428, 0x019C, 2, 0x0000, 0, 0),
++	MX6_PAD_NAND_DATA07__ECSPI4_SS0                        = IOMUX_PAD(0x0428, 0x019C, 3, 0x0570, 1, 0),
++	MX6_PAD_NAND_DATA07__EIM_AD15                          = IOMUX_PAD(0x0428, 0x019C, 4, 0x0000, 0, 0),
++	MX6_PAD_NAND_DATA07__GPIO4_IO09                        = IOMUX_PAD(0x0428, 0x019C, 5, 0x0000, 0, 0),
++	MX6_PAD_NAND_DATA07__UART2_DCE_RTS                     = IOMUX_PAD(0x0428, 0x019C, 8, 0x0628, 5, 0),
++	MX6_PAD_NAND_DATA07__UART2_DTE_CTS                     = IOMUX_PAD(0x0428, 0x019C, 8, 0x0000, 0, 0),
++
++	MX6_PAD_NAND_ALE__RAWNAND_ALE                          = IOMUX_PAD(0x042C, 0x01A0, 0, 0x0000, 0, 0),
++	MX6_PAD_NAND_ALE__USDHC2_RESET_B                       = IOMUX_PAD(0x042C, 0x01A0, 1, 0x0000, 0, 0),
++	MX6_PAD_NAND_ALE__QSPI_A_DQS                           = IOMUX_PAD(0x042C, 0x01A0, 2, 0x0000, 0, 0),
++	MX6_PAD_NAND_ALE__PWM3_OUT                             = IOMUX_PAD(0x042C, 0x01A0, 3, 0x0000, 0, 0),
++	MX6_PAD_NAND_ALE__EIM_ADDR17                           = IOMUX_PAD(0x042C, 0x01A0, 4, 0x0000, 0, 0),
++	MX6_PAD_NAND_ALE__GPIO4_IO10                           = IOMUX_PAD(0x042C, 0x01A0, 5, 0x0000, 0, 0),
++	MX6_PAD_NAND_ALE__ECSPI3_SS1                           = IOMUX_PAD(0x042C, 0x01A0, 8, 0x0000, 0, 0),
++
++	MX6_PAD_NAND_WP_B__RAWNAND_WP_B                        = IOMUX_PAD(0x0430, 0x01A4, 0, 0x0000, 0, 0),
++	MX6_PAD_NAND_WP_B__USDHC1_RESET_B                      = IOMUX_PAD(0x0430, 0x01A4, 1, 0x0000, 0, 0),
++	MX6_PAD_NAND_WP_B__QSPI_A_SCLK                         = IOMUX_PAD(0x0430, 0x01A4, 2, 0x0000, 0, 0),
++	MX6_PAD_NAND_WP_B__PWM4_OUT                            = IOMUX_PAD(0x0430, 0x01A4, 3, 0x0000, 0, 0),
++	MX6_PAD_NAND_WP_B__EIM_BCLK                            = IOMUX_PAD(0x0430, 0x01A4, 4, 0x0000, 0, 0),
++	MX6_PAD_NAND_WP_B__GPIO4_IO11                          = IOMUX_PAD(0x0430, 0x01A4, 5, 0x0000, 0, 0),
++	MX6_PAD_NAND_WP_B__ECSPI3_RDY                          = IOMUX_PAD(0x0430, 0x01A4, 8, 0x0000, 0, 0),
++
++	MX6_PAD_NAND_READY_B__RAWNAND_READY_B                  = IOMUX_PAD(0x0434, 0x01A8, 0, 0x0000, 0, 0),
++	MX6_PAD_NAND_READY_B__USDHC1_DATA4                     = IOMUX_PAD(0x0434, 0x01A8, 1, 0x0000, 0, 0),
++	MX6_PAD_NAND_READY_B__QSPI_A_DATA00                    = IOMUX_PAD(0x0434, 0x01A8, 2, 0x0000, 0, 0),
++	MX6_PAD_NAND_READY_B__ECSPI3_SS0                       = IOMUX_PAD(0x0434, 0x01A8, 3, 0x0560, 1, 0),
++	MX6_PAD_NAND_READY_B__EIM_CS1_B                        = IOMUX_PAD(0x0434, 0x01A8, 4, 0x0000, 0, 0),
++	MX6_PAD_NAND_READY_B__GPIO4_IO12                       = IOMUX_PAD(0x0434, 0x01A8, 5, 0x0000, 0, 0),
++	MX6_PAD_NAND_READY_B__UART3_DCE_TX                     = IOMUX_PAD(0x0434, 0x01A8, 8, 0x0000, 0, 0),
++	MX6_PAD_NAND_READY_B__UART3_DTE_RX                     = IOMUX_PAD(0x0434, 0x01A8, 8, 0x0634, 2, 0),
++
++	MX6_PAD_NAND_CE0_B__RAWNAND_CE0_B                      = IOMUX_PAD(0x0438, 0x01AC, 0, 0x0000, 0, 0),
++	MX6_PAD_NAND_CE0_B__USDHC1_DATA5                       = IOMUX_PAD(0x0438, 0x01AC, 1, 0x0000, 0, 0),
++	MX6_PAD_NAND_CE0_B__QSPI_A_DATA01                      = IOMUX_PAD(0x0438, 0x01AC, 2, 0x0000, 0, 0),
++	MX6_PAD_NAND_CE0_B__ECSPI3_SCLK                        = IOMUX_PAD(0x0438, 0x01AC, 3, 0x0554, 1, 0),
++	MX6_PAD_NAND_CE0_B__EIM_DTACK_B                        = IOMUX_PAD(0x0438, 0x01AC, 4, 0x0000, 0, 0),
++	MX6_PAD_NAND_CE0_B__GPIO4_IO13                         = IOMUX_PAD(0x0438, 0x01AC, 5, 0x0000, 0, 0),
++	MX6_PAD_NAND_CE0_B__UART3_DCE_RX                       = IOMUX_PAD(0x0438, 0x01AC, 8, 0x0634, 3, 0),
++	MX6_PAD_NAND_CE0_B__UART3_DTE_TX                       = IOMUX_PAD(0x0438, 0x01AC, 8, 0x0000, 0, 0),
++
++	MX6_PAD_NAND_CE1_B__RAWNAND_CE1_B                      = IOMUX_PAD(0x043C, 0x01B0, 0, 0x0000, 0, 0),
++	MX6_PAD_NAND_CE1_B__USDHC1_DATA6                       = IOMUX_PAD(0x043C, 0x01B0, 1, 0x0000, 0, 0),
++	MX6_PAD_NAND_CE1_B__QSPI_A_DATA02                      = IOMUX_PAD(0x043C, 0x01B0, 2, 0x0000, 0, 0),
++	MX6_PAD_NAND_CE1_B__ECSPI3_MOSI                        = IOMUX_PAD(0x043C, 0x01B0, 3, 0x055C, 1, 0),
++	MX6_PAD_NAND_CE1_B__EIM_ADDR18                         = IOMUX_PAD(0x043C, 0x01B0, 4, 0x0000, 0, 0),
++	MX6_PAD_NAND_CE1_B__GPIO4_IO14                         = IOMUX_PAD(0x043C, 0x01B0, 5, 0x0000, 0, 0),
++	MX6_PAD_NAND_CE1_B__UART3_DCE_CTS                      = IOMUX_PAD(0x043C, 0x01B0, 8, 0x0000, 0, 0),
++	MX6_PAD_NAND_CE1_B__UART3_DTE_RTS                      = IOMUX_PAD(0x043C, 0x01B0, 8, 0x0630, 2, 0),
++
++	MX6_PAD_NAND_CLE__RAWNAND_CLE                          = IOMUX_PAD(0x0440, 0x01B4, 0, 0x0000, 0, 0),
++	MX6_PAD_NAND_CLE__USDHC1_DATA7                         = IOMUX_PAD(0x0440, 0x01B4, 1, 0x0000, 0, 0),
++	MX6_PAD_NAND_CLE__QSPI_A_DATA03                        = IOMUX_PAD(0x0440, 0x01B4, 2, 0x0000, 0, 0),
++	MX6_PAD_NAND_CLE__ECSPI3_MISO                          = IOMUX_PAD(0x0440, 0x01B4, 3, 0x0558, 1, 0),
++	MX6_PAD_NAND_CLE__EIM_ADDR16                           = IOMUX_PAD(0x0440, 0x01B4, 4, 0x0000, 0, 0),
++	MX6_PAD_NAND_CLE__GPIO4_IO15                           = IOMUX_PAD(0x0440, 0x01B4, 5, 0x0000, 0, 0),
++	MX6_PAD_NAND_CLE__UART3_DCE_RTS                        = IOMUX_PAD(0x0440, 0x01B4, 8, 0x0630, 3, 0),
++	MX6_PAD_NAND_CLE__UART3_DTE_CTS                        = IOMUX_PAD(0x0440, 0x01B4, 8, 0x0000, 0, 0),
++
++	MX6_PAD_NAND_DQS__RAWNAND_DQS                          = IOMUX_PAD(0x0444, 0x01B8, 0, 0x0000, 0, 0),
++	MX6_PAD_NAND_DQS__CSI_FIELD                            = IOMUX_PAD(0x0444, 0x01B8, 1, 0x0530, 1, 0),
++	MX6_PAD_NAND_DQS__QSPI_A_SS0_B                         = IOMUX_PAD(0x0444, 0x01B8, 2, 0x0000, 0, 0),
++	MX6_PAD_NAND_DQS__PWM5_OUT                             = IOMUX_PAD(0x0444, 0x01B8, 3, 0x0000, 0, 0),
++	MX6_PAD_NAND_DQS__EIM_WAIT                             = IOMUX_PAD(0x0444, 0x01B8, 4, 0x0000, 0, 0),
++	MX6_PAD_NAND_DQS__GPIO4_IO16                           = IOMUX_PAD(0x0444, 0x01B8, 5, 0x0000, 0, 0),
++	MX6_PAD_NAND_DQS__SDMA_EXT_EVENT01                     = IOMUX_PAD(0x0444, 0x01B8, 6, 0x0614, 1, 0),
++	MX6_PAD_NAND_DQS__SPDIF_EXT_CLK                        = IOMUX_PAD(0x0444, 0x01B8, 8, 0x061C, 1, 0),
++
++	MX6_PAD_SD1_CMD__USDHC1_CMD                            = IOMUX_PAD(0x0448, 0x01BC, 0, 0x0000, 0, 0),
++	MX6_PAD_SD1_CMD__GPT2_COMPARE1                         = IOMUX_PAD(0x0448, 0x01BC, 1, 0x0000, 0, 0),
++	MX6_PAD_SD1_CMD__SAI2_RX_SYNC                          = IOMUX_PAD(0x0448, 0x01BC, 2, 0x0000, 0, 0),
++	MX6_PAD_SD1_CMD__SPDIF_OUT                             = IOMUX_PAD(0x0448, 0x01BC, 3, 0x0000, 0, 0),
++	MX6_PAD_SD1_CMD__EIM_ADDR19                            = IOMUX_PAD(0x0448, 0x01BC, 4, 0x0000, 0, 0),
++	MX6_PAD_SD1_CMD__GPIO2_IO16                            = IOMUX_PAD(0x0448, 0x01BC, 5, 0x0000, 0, 0),
++	MX6_PAD_SD1_CMD__SDMA_EXT_EVENT00                      = IOMUX_PAD(0x0448, 0x01BC, 6, 0x0610, 2, 0),
++	MX6_PAD_SD1_CMD__USB_OTG1_PWR                          = IOMUX_PAD(0x0448, 0x01BC, 8, 0x0000, 0, 0),
++
++	MX6_PAD_SD1_CLK__USDHC1_CLK                            = IOMUX_PAD(0x044C, 0x01C0, 0, 0x0000, 0, 0),
++	MX6_PAD_SD1_CLK__GPT2_COMPARE2                         = IOMUX_PAD(0x044C, 0x01C0, 1, 0x0000, 0, 0),
++	MX6_PAD_SD1_CLK__SAI2_MCLK                             = IOMUX_PAD(0x044C, 0x01C0, 2, 0x05F0, 1, 0),
++	MX6_PAD_SD1_CLK__SPDIF_IN                              = IOMUX_PAD(0x044C, 0x01C0, 3, 0x0618, 3, 0),
++	MX6_PAD_SD1_CLK__EIM_ADDR20                            = IOMUX_PAD(0x044C, 0x01C0, 4, 0x0000, 0, 0),
++	MX6_PAD_SD1_CLK__GPIO2_IO17                            = IOMUX_PAD(0x044C, 0x01C0, 5, 0x0000, 0, 0),
++	MX6_PAD_SD1_CLK__USB_OTG1_OC                           = IOMUX_PAD(0x044C, 0x01C0, 8, 0x0664, 2, 0),
++
++	MX6_PAD_SD1_DATA0__USDHC1_DATA0                        = IOMUX_PAD(0x0450, 0x01C4, 0, 0x0000, 0, 0),
++	MX6_PAD_SD1_DATA0__GPT2_COMPARE3                       = IOMUX_PAD(0x0450, 0x01C4, 1, 0x0000, 0, 0),
++	MX6_PAD_SD1_DATA0__SAI2_TX_SYNC                        = IOMUX_PAD(0x0450, 0x01C4, 2, 0x05FC, 1, 0),
++	MX6_PAD_SD1_DATA0__FLEXCAN1_TX                         = IOMUX_PAD(0x0450, 0x01C4, 3, 0x0000, 0, 0),
++	MX6_PAD_SD1_DATA0__EIM_ADDR21                          = IOMUX_PAD(0x0450, 0x01C4, 4, 0x0000, 0, 0),
++	MX6_PAD_SD1_DATA0__GPIO2_IO18                          = IOMUX_PAD(0x0450, 0x01C4, 5, 0x0000, 0, 0),
++	MX6_PAD_SD1_DATA0__ANATOP_OTG1_ID                      = IOMUX_PAD(0x0450, 0x01C4, 8, 0x04B8, 2, 0),
++
++	MX6_PAD_SD1_DATA1__USDHC1_DATA1                        = IOMUX_PAD(0x0454, 0x01C8, 0, 0x0000, 0, 0),
++	MX6_PAD_SD1_DATA1__GPT2_CLK                            = IOMUX_PAD(0x0454, 0x01C8, 1, 0x05A0, 1, 0),
++	MX6_PAD_SD1_DATA1__SAI2_TX_BCLK                        = IOMUX_PAD(0x0454, 0x01C8, 2, 0x05F8, 1, 0),
++	MX6_PAD_SD1_DATA1__FLEXCAN1_RX                         = IOMUX_PAD(0x0454, 0x01C8, 3, 0x0584, 3, 0),
++	MX6_PAD_SD1_DATA1__EIM_ADDR22                          = IOMUX_PAD(0x0454, 0x01C8, 4, 0x0000, 0, 0),
++	MX6_PAD_SD1_DATA1__GPIO2_IO19                          = IOMUX_PAD(0x0454, 0x01C8, 5, 0x0000, 0, 0),
++	MX6_PAD_SD1_DATA1__USB_OTG2_PWR                        = IOMUX_PAD(0x0454, 0x01C8, 8, 0x0000, 0, 0),
++
++	MX6_PAD_SD1_DATA2__USDHC1_DATA2                        = IOMUX_PAD(0x0458, 0x01CC, 0, 0x0000, 0, 0),
++	MX6_PAD_SD1_DATA2__GPT2_CAPTURE1                       = IOMUX_PAD(0x0458, 0x01CC, 1, 0x0598, 1, 0),
++	MX6_PAD_SD1_DATA2__SAI2_RX_DATA                        = IOMUX_PAD(0x0458, 0x01CC, 2, 0x05F4, 1, 0),
++	MX6_PAD_SD1_DATA2__FLEXCAN2_TX                         = IOMUX_PAD(0x0458, 0x01CC, 3, 0x0000, 0, 0),
++	MX6_PAD_SD1_DATA2__EIM_ADDR23                          = IOMUX_PAD(0x0458, 0x01CC, 4, 0x0000, 0, 0),
++	MX6_PAD_SD1_DATA2__GPIO2_IO20                          = IOMUX_PAD(0x0458, 0x01CC, 5, 0x0000, 0, 0),
++	MX6_PAD_SD1_DATA2__CCM_CLKO1                           = IOMUX_PAD(0x0458, 0x01CC, 6, 0x0000, 0, 0),
++	MX6_PAD_SD1_DATA2__USB_OTG2_OC                         = IOMUX_PAD(0x0458, 0x01CC, 8, 0x0660, 2, 0),
++
++	MX6_PAD_SD1_DATA3__USDHC1_DATA3                        = IOMUX_PAD(0x045C, 0x01D0, 0, 0x0000, 0, 0),
++	MX6_PAD_SD1_DATA3__GPT2_CAPTURE2                       = IOMUX_PAD(0x045C, 0x01D0, 1, 0x059C, 1, 0),
++	MX6_PAD_SD1_DATA3__SAI2_TX_DATA                        = IOMUX_PAD(0x045C, 0x01D0, 2, 0x0000, 0, 0),
++	MX6_PAD_SD1_DATA3__FLEXCAN2_RX                         = IOMUX_PAD(0x045C, 0x01D0, 3, 0x0588, 3, 0),
++	MX6_PAD_SD1_DATA3__EIM_ADDR24                          = IOMUX_PAD(0x045C, 0x01D0, 4, 0x0000, 0, 0),
++	MX6_PAD_SD1_DATA3__GPIO2_IO21                          = IOMUX_PAD(0x045C, 0x01D0, 5, 0x0000, 0, 0),
++	MX6_PAD_SD1_DATA3__CCM_CLKO2                           = IOMUX_PAD(0x045C, 0x01D0, 6, 0x0000, 0, 0),
++	MX6_PAD_SD1_DATA3__ANATOP_OTG2_ID                      = IOMUX_PAD(0x045C, 0x01D0, 8, 0x04BC, 2, 0),
++
++	MX6_PAD_CSI_MCLK__CSI_MCLK                             = IOMUX_PAD(0x0460, 0x01D4, 0, 0x0000, 0, 0),
++	MX6_PAD_CSI_MCLK__USDHC2_CD_B                          = IOMUX_PAD(0x0460, 0x01D4, 1, 0x0674, 0, 0),
++	MX6_PAD_CSI_MCLK__RAWNAND_CE2_B                        = IOMUX_PAD(0x0460, 0x01D4, 2, 0x0000, 0, 0),
++	MX6_PAD_CSI_MCLK__I2C1_SDA                             = IOMUX_PAD(0x0460, 0x01D4, IOMUX_CONFIG_SION | 3, 0x05A8, 0, 0),
++	MX6_PAD_CSI_MCLK__EIM_CS0_B                            = IOMUX_PAD(0x0460, 0x01D4, 4, 0x0000, 0, 0),
++	MX6_PAD_CSI_MCLK__GPIO4_IO17                           = IOMUX_PAD(0x0460, 0x01D4, 5, 0x0000, 0, 0),
++	MX6_PAD_CSI_MCLK__SNVS_HP_VIO_5_CTL                    = IOMUX_PAD(0x0460, 0x01D4, 6, 0x0000, 0, 0),
++	MX6_PAD_CSI_MCLK__UART6_DCE_TX                         = IOMUX_PAD(0x0460, 0x01D4, 8, 0x0000, 0, 0),
++	MX6_PAD_CSI_MCLK__UART6_DTE_RX                         = IOMUX_PAD(0x0460, 0x01D4, 8, 0x064C, 0, 0),
++
++	MX6_PAD_CSI_PIXCLK__CSI_PIXCLK                         = IOMUX_PAD(0x0464, 0x01D8, 0, 0x0528, 1, 0),
++	MX6_PAD_CSI_PIXCLK__USDHC2_WP                          = IOMUX_PAD(0x0464, 0x01D8, 1, 0x069C, 2, 0),
++	MX6_PAD_CSI_PIXCLK__RAWNAND_CE3_B                      = IOMUX_PAD(0x0464, 0x01D8, 2, 0x0000, 0, 0),
++	MX6_PAD_CSI_PIXCLK__I2C1_SCL                           = IOMUX_PAD(0x0464, 0x01D8, IOMUX_CONFIG_SION | 3, 0x05A4, 2, 0),
++	MX6_PAD_CSI_PIXCLK__EIM_OE                             = IOMUX_PAD(0x0464, 0x01D8, 4, 0x0000, 0, 0),
++	MX6_PAD_CSI_PIXCLK__GPIO4_IO18                         = IOMUX_PAD(0x0464, 0x01D8, 5, 0x0000, 0, 0),
++	MX6_PAD_CSI_PIXCLK__SNVS_HP_VIO_5                      = IOMUX_PAD(0x0464, 0x01D8, 6, 0x0000, 0, 0),
++	MX6_PAD_CSI_PIXCLK__UART6_DCE_RX                       = IOMUX_PAD(0x0464, 0x01D8, 8, 0x064C, 3, 0),
++	MX6_PAD_CSI_PIXCLK__UART6_DTE_TX                       = IOMUX_PAD(0x0464, 0x01D8, 8, 0x0000, 0, 0),
++
++	MX6_PAD_CSI_VSYNC__CSI_VSYNC                           = IOMUX_PAD(0x0468, 0x01DC, 0, 0x052C, 0, 0),
++	MX6_PAD_CSI_VSYNC__USDHC2_CLK                          = IOMUX_PAD(0x0468, 0x01DC, 1, 0x0670, 0, 0),
++	MX6_PAD_CSI_VSYNC__SIM1_PORT1_CLK                      = IOMUX_PAD(0x0468, 0x01DC, 2, 0x0000, 0, 0),
++	MX6_PAD_CSI_VSYNC__I2C2_SDA                            = IOMUX_PAD(0x0468, 0x01DC, IOMUX_CONFIG_SION | 3, 0x05B0, 0, 0),
++	MX6_PAD_CSI_VSYNC__EIM_RW                              = IOMUX_PAD(0x0468, 0x01DC, 4, 0x0000, 0, 0),
++	MX6_PAD_CSI_VSYNC__GPIO4_IO19                          = IOMUX_PAD(0x0468, 0x01DC, 5, 0x0000, 0, 0),
++	MX6_PAD_CSI_VSYNC__PWM7_OUT                            = IOMUX_PAD(0x0468, 0x01DC, 6, 0x0000, 0, 0),
++	MX6_PAD_CSI_VSYNC__UART6_DCE_RTS                       = IOMUX_PAD(0x0468, 0x01DC, 8, 0x0648, 0, 0),
++	MX6_PAD_CSI_VSYNC__UART6_DTE_CTS                       = IOMUX_PAD(0x0468, 0x01DC, 8, 0x0000, 0, 0),
++
++	MX6_PAD_CSI_HSYNC__CSI_HSYNC                           = IOMUX_PAD(0x046C, 0x01E0, 0, 0x0524, 0, 0),
++	MX6_PAD_CSI_HSYNC__USDHC2_CMD                          = IOMUX_PAD(0x046C, 0x01E0, 1, 0x0678, 0, 0),
++	MX6_PAD_CSI_HSYNC__SIM1_PORT1_PD                       = IOMUX_PAD(0x046C, 0x01E0, 2, 0x0000, 0, 0),
++	MX6_PAD_CSI_HSYNC__I2C2_SCL                            = IOMUX_PAD(0x046C, 0x01E0, IOMUX_CONFIG_SION | 3, 0x05AC, 0, 0),
++	MX6_PAD_CSI_HSYNC__EIM_LBA_B                           = IOMUX_PAD(0x046C, 0x01E0, 4, 0x0000, 0, 0),
++	MX6_PAD_CSI_HSYNC__GPIO4_IO20                          = IOMUX_PAD(0x046C, 0x01E0, 5, 0x0000, 0, 0),
++	MX6_PAD_CSI_HSYNC__PWM8_OUT                            = IOMUX_PAD(0x046C, 0x01E0, 6, 0x0000, 0, 0),
++	MX6_PAD_CSI_HSYNC__UART6_DCE_CTS                       = IOMUX_PAD(0x046C, 0x01E0, 8, 0x0000, 0, 0),
++	MX6_PAD_CSI_HSYNC__UART6_DTE_RTS                       = IOMUX_PAD(0x046C, 0x01E0, 8, 0x0648, 1, 0),
++
++	MX6_PAD_CSI_DATA00__CSI_DATA02                         = IOMUX_PAD(0x0470, 0x01E4, 0, 0x04C4, 0, 0),
++	MX6_PAD_CSI_DATA00__USDHC2_DATA0                       = IOMUX_PAD(0x0470, 0x01E4, 1, 0x067C, 0, 0),
++	MX6_PAD_CSI_DATA00__SIM1_PORT1_RST_B                   = IOMUX_PAD(0x0470, 0x01E4, 2, 0x0000, 0, 0),
++	MX6_PAD_CSI_DATA00__ECSPI2_SCLK                        = IOMUX_PAD(0x0470, 0x01E4, 3, 0x0544, 0, 0),
++	MX6_PAD_CSI_DATA00__EIM_AD00                           = IOMUX_PAD(0x0470, 0x01E4, 4, 0x0000, 0, 0),
++	MX6_PAD_CSI_DATA00__GPIO4_IO21                         = IOMUX_PAD(0x0470, 0x01E4, 5, 0x0000, 0, 0),
++	MX6_PAD_CSI_DATA00__SRC_INT_BOOT                       = IOMUX_PAD(0x0470, 0x01E4, 6, 0x0000, 0, 0),
++	MX6_PAD_CSI_DATA00__UART5_DCE_TX                       = IOMUX_PAD(0x0470, 0x01E4, 8, 0x0000, 0, 0),
++	MX6_PAD_CSI_DATA00__UART5_DTE_RX                       = IOMUX_PAD(0x0470, 0x01E4, 8, 0x0644, 0, 0),
++
++	MX6_PAD_CSI_DATA01__CSI_DATA03                         = IOMUX_PAD(0x0474, 0x01E8, 0, 0x04C8, 0, 0),
++	MX6_PAD_CSI_DATA01__USDHC2_DATA1                       = IOMUX_PAD(0x0474, 0x01E8, 1, 0x0680, 0, 0),
++	MX6_PAD_CSI_DATA01__SIM1_PORT1_SVEN                    = IOMUX_PAD(0x0474, 0x01E8, 2, 0x0000, 0, 0),
++	MX6_PAD_CSI_DATA01__ECSPI2_SS0                         = IOMUX_PAD(0x0474, 0x01E8, 3, 0x0550, 0, 0),
++	MX6_PAD_CSI_DATA01__EIM_AD01                           = IOMUX_PAD(0x0474, 0x01E8, 4, 0x0000, 0, 0),
++	MX6_PAD_CSI_DATA01__GPIO4_IO22                         = IOMUX_PAD(0x0474, 0x01E8, 5, 0x0000, 0, 0),
++	MX6_PAD_CSI_DATA01__SAI1_MCLK                          = IOMUX_PAD(0x0474, 0x01E8, 6, 0x05E0, 0, 0),
++	MX6_PAD_CSI_DATA01__UART5_DCE_RX                       = IOMUX_PAD(0x0474, 0x01E8, 8, 0x0644, 1, 0),
++	MX6_PAD_CSI_DATA01__UART5_DTE_TX                       = IOMUX_PAD(0x0474, 0x01E8, 8, 0x0000, 0, 0),
++
++	MX6_PAD_CSI_DATA02__CSI_DATA04                         = IOMUX_PAD(0x0478, 0x01EC, 0, 0x04D8, 1, 0),
++	MX6_PAD_CSI_DATA02__USDHC2_DATA2                       = IOMUX_PAD(0x0478, 0x01EC, 1, 0x0684, 2, 0),
++	MX6_PAD_CSI_DATA02__SIM1_PORT1_TRXD                    = IOMUX_PAD(0x0478, 0x01EC, 2, 0x0000, 0, 0),
++	MX6_PAD_CSI_DATA02__ECSPI2_MOSI                        = IOMUX_PAD(0x0478, 0x01EC, 3, 0x054C, 1, 0),
++	MX6_PAD_CSI_DATA02__EIM_AD02                           = IOMUX_PAD(0x0478, 0x01EC, 4, 0x0000, 0, 0),
++	MX6_PAD_CSI_DATA02__GPIO4_IO23                         = IOMUX_PAD(0x0478, 0x01EC, 5, 0x0000, 0, 0),
++	MX6_PAD_CSI_DATA02__SAI1_RX_SYNC                       = IOMUX_PAD(0x0478, 0x01EC, 6, 0x0000, 0, 0),
++	MX6_PAD_CSI_DATA02__UART5_DCE_RTS                      = IOMUX_PAD(0x0478, 0x01EC, 8, 0x0640, 5, 0),
++	MX6_PAD_CSI_DATA02__UART5_DTE_CTS                      = IOMUX_PAD(0x0478, 0x01EC, 8, 0x0000, 0, 0),
++
++	MX6_PAD_CSI_DATA03__CSI_DATA05                         = IOMUX_PAD(0x047C, 0x01F0, 0, 0x04CC, 0, 0),
++	MX6_PAD_CSI_DATA03__USDHC2_DATA3                       = IOMUX_PAD(0x047C, 0x01F0, 1, 0x0688, 0, 0),
++	MX6_PAD_CSI_DATA03__SIM2_PORT1_PD                      = IOMUX_PAD(0x047C, 0x01F0, 2, 0x0000, 0, 0),
++	MX6_PAD_CSI_DATA03__ECSPI2_MISO                        = IOMUX_PAD(0x047C, 0x01F0, 3, 0x0548, 0, 0),
++	MX6_PAD_CSI_DATA03__EIM_AD03                           = IOMUX_PAD(0x047C, 0x01F0, 4, 0x0000, 0, 0),
++	MX6_PAD_CSI_DATA03__GPIO4_IO24                         = IOMUX_PAD(0x047C, 0x01F0, 5, 0x0000, 0, 0),
++	MX6_PAD_CSI_DATA03__SAI1_RX_BCLK                       = IOMUX_PAD(0x047C, 0x01F0, 6, 0x0000, 0, 0),
++	MX6_PAD_CSI_DATA03__UART5_DCE_CTS                      = IOMUX_PAD(0x047C, 0x01F0, 8, 0x0000, 0, 0),
++	MX6_PAD_CSI_DATA03__UART5_DTE_RTS                      = IOMUX_PAD(0x047C, 0x01F0, 8, 0x0640, 0, 0),
++
++	MX6_PAD_CSI_DATA04__CSI_DATA06                         = IOMUX_PAD(0x0480, 0x01F4, 0, 0x04DC, 1, 0),
++	MX6_PAD_CSI_DATA04__USDHC2_DATA4                       = IOMUX_PAD(0x0480, 0x01F4, 1, 0x068C, 2, 0),
++	MX6_PAD_CSI_DATA04__SIM2_PORT1_CLK                     = IOMUX_PAD(0x0480, 0x01F4, 2, 0x0000, 0, 0),
++	MX6_PAD_CSI_DATA04__ECSPI1_SCLK                        = IOMUX_PAD(0x0480, 0x01F4, 3, 0x0534, 1, 0),
++	MX6_PAD_CSI_DATA04__EIM_AD04                           = IOMUX_PAD(0x0480, 0x01F4, 4, 0x0000, 0, 0),
++	MX6_PAD_CSI_DATA04__GPIO4_IO25                         = IOMUX_PAD(0x0480, 0x01F4, 5, 0x0000, 0, 0),
++	MX6_PAD_CSI_DATA04__SAI1_TX_SYNC                       = IOMUX_PAD(0x0480, 0x01F4, 6, 0x05EC, 1, 0),
++	MX6_PAD_CSI_DATA04__USDHC1_WP                          = IOMUX_PAD(0x0480, 0x01F4, 8, 0x066C, 2, 0),
++
++	MX6_PAD_CSI_DATA05__CSI_DATA07                         = IOMUX_PAD(0x0484, 0x01F8, 0, 0x04E0, 1, 0),
++	MX6_PAD_CSI_DATA05__USDHC2_DATA5                       = IOMUX_PAD(0x0484, 0x01F8, 1, 0x0690, 2, 0),
++	MX6_PAD_CSI_DATA05__SIM2_PORT1_RST_B                   = IOMUX_PAD(0x0484, 0x01F8, 2, 0x0000, 0, 0),
++	MX6_PAD_CSI_DATA05__ECSPI1_SS0                         = IOMUX_PAD(0x0484, 0x01F8, 3, 0x0540, 1, 0),
++	MX6_PAD_CSI_DATA05__EIM_AD05                           = IOMUX_PAD(0x0484, 0x01F8, 4, 0x0000, 0, 0),
++	MX6_PAD_CSI_DATA05__GPIO4_IO26                         = IOMUX_PAD(0x0484, 0x01F8, 5, 0x0000, 0, 0),
++	MX6_PAD_CSI_DATA05__SAI1_TX_BCLK                       = IOMUX_PAD(0x0484, 0x01F8, 6, 0x05E8, 1, 0),
++	MX6_PAD_CSI_DATA05__USDHC1_CD_B                        = IOMUX_PAD(0x0484, 0x01F8, 8, 0x0668, 2, 0),
++
++	MX6_PAD_CSI_DATA06__CSI_DATA08                         = IOMUX_PAD(0x0488, 0x01FC, 0, 0x04E4, 1, 0),
++	MX6_PAD_CSI_DATA06__USDHC2_DATA6                       = IOMUX_PAD(0x0488, 0x01FC, 1, 0x0694, 2, 0),
++	MX6_PAD_CSI_DATA06__SIM2_PORT1_SVEN                    = IOMUX_PAD(0x0488, 0x01FC, 2, 0x0000, 0, 0),
++	MX6_PAD_CSI_DATA06__ECSPI1_MOSI                        = IOMUX_PAD(0x0488, 0x01FC, 3, 0x053C, 1, 0),
++	MX6_PAD_CSI_DATA06__EIM_AD06                           = IOMUX_PAD(0x0488, 0x01FC, 4, 0x0000, 0, 0),
++	MX6_PAD_CSI_DATA06__GPIO4_IO27                         = IOMUX_PAD(0x0488, 0x01FC, 5, 0x0000, 0, 0),
++	MX6_PAD_CSI_DATA06__SAI1_RX_DATA                       = IOMUX_PAD(0x0488, 0x01FC, 6, 0x05E4, 1, 0),
++	MX6_PAD_CSI_DATA06__USDHC1_RESET_B                     = IOMUX_PAD(0x0488, 0x01FC, 8, 0x0000, 0, 0),
++
++	MX6_PAD_CSI_DATA07__CSI_DATA09                         = IOMUX_PAD(0x048C, 0x0200, 0, 0x04E8, 1, 0),
++	MX6_PAD_CSI_DATA07__USDHC2_DATA7                       = IOMUX_PAD(0x048C, 0x0200, 1, 0x0698, 2, 0),
++	MX6_PAD_CSI_DATA07__SIM2_PORT1_TRXD                    = IOMUX_PAD(0x048C, 0x0200, 2, 0x0000, 0, 0),
++	MX6_PAD_CSI_DATA07__ECSPI1_MISO                        = IOMUX_PAD(0x048C, 0x0200, 3, 0x0538, 1, 0),
++	MX6_PAD_CSI_DATA07__EIM_AD07                           = IOMUX_PAD(0x048C, 0x0200, 4, 0x0000, 0, 0),
++	MX6_PAD_CSI_DATA07__GPIO4_IO28                         = IOMUX_PAD(0x048C, 0x0200, 5, 0x0000, 0, 0),
++	MX6_PAD_CSI_DATA07__SAI1_TX_DATA                       = IOMUX_PAD(0x048C, 0x0200, 6, 0x0000, 0, 0),
++	MX6_PAD_CSI_DATA07__USDHC1_VSELECT                     = IOMUX_PAD(0x048C, 0x0200, 8, 0x0000, 0, 0),
++};
++#endif  /* __ASM_ARCH_IMX6UL_PINS_H__ */
+diff -Naur A/arch/arm/include/asm/arch-mx6/snvs.h B/arch/arm/include/asm/arch-mx6/snvs.h
+--- A/arch/arm/include/asm/arch-mx6/snvs.h	1970-01-01 05:30:00.000000000 +0530
++++ B/arch/arm/include/asm/arch-mx6/snvs.h	2017-06-09 11:08:40.067199197 +0530
+@@ -0,0 +1,58 @@
++/*
++ * Copyright (C) 2012-2015 Freescale Semiconductor, Inc. All Rights Reserved.
++ *
++ * SPDX-License-Identifier:    GPL-2.0+
++ *
++*/
++
++#ifndef __SECURE_MX6UL_H__
++#define __SECURE_MX6UL_H__
++
++#define OCOTP_LOCK			OCOTP_BASE_ADDR + 0x400
++#define OCOTP_CFG2			OCOTP_BASE_ADDR + 0x430
++
++#define SNVS_HPCOMR			SNVS_BASE_ADDR + 0x04
++#define SNVS_HPSICR			SNVS_BASE_ADDR + 0x0C
++#define SNVS_HPSVCR			SNVS_BASE_ADDR + 0x10
++#define SNVS_HPSR			SNVS_BASE_ADDR + 0x14
++#define SNVS_HPSVSR			SNVS_BASE_ADDR + 0x18
++#define SNVS_LPCR			SNVS_BASE_ADDR + 0x38
++#define SNVS_LPMKCR			SNVS_BASE_ADDR + 0x3C
++#define SNVS_LPTGFCR		SNVS_BASE_ADDR + 0x44
++#define SNVS_LPTDCR			SNVS_BASE_ADDR + 0x48
++#define SNVS_LPSR			SNVS_BASE_ADDR + 0x4C
++#define SNVS_LPPGDR			SNVS_BASE_ADDR + 0x64
++#define SNVS_LPZMKR0		SNVS_BASE_ADDR + 0x6C
++#define SNVS_LPZMKR1		SNVS_BASE_ADDR + 0x70
++#define SNVS_LPZMKR2		SNVS_BASE_ADDR + 0x74
++#define SNVS_LPZMKR3		SNVS_BASE_ADDR + 0x78
++#define SNVS_LPZMKR4		SNVS_BASE_ADDR + 0x7C
++#define SNVS_LPZMKR5		SNVS_BASE_ADDR + 0x80
++#define SNVS_LPZMKR6		SNVS_BASE_ADDR + 0x84
++#define SNVS_LPZMKR7		SNVS_BASE_ADDR + 0x88
++#define SNVS_LPTDC2R		SNVS_BASE_ADDR + 0xA0
++#define SNVS_LPTDSR			SNVS_BASE_ADDR + 0xA4
++#define SNVS_LPTGF1CR		SNVS_BASE_ADDR + 0xA8
++#define SNVS_LPTGF2CR		SNVS_BASE_ADDR + 0xAC
++#define SNVS_LPAT1CR		SNVS_BASE_ADDR + 0xC0
++#define SNVS_LPATCTLR		SNVS_BASE_ADDR + 0xE0
++#define SNVS_LPATCLKR		SNVS_BASE_ADDR + 0xE4
++#define SNVS_LPATRC1R		SNVS_BASE_ADDR + 0xE8
++#define SNVS_LPATRC2R		SNVS_BASE_ADDR + 0xEC
++
++#define DRY_TPCTRL0_OFFSET	SNVS_LP_BASE_ADDR + 0x10
++#define DRY_TPCTRL1_OFFSET	SNVS_LP_BASE_ADDR + 0x14
++#define DRY_TPCTRL2_OFFSET	SNVS_LP_BASE_ADDR + 0x18
++#define DRY_TPCTRL3_OFFSET	SNVS_LP_BASE_ADDR + 0x1C
++#define DRY_TPCTRL4_OFFSET	SNVS_LP_BASE_ADDR + 0x20
++#define DRY_TPCTRL5_OFFSET	SNVS_LP_BASE_ADDR + 0x24
++#define DRY_TPCTRL6_OFFSET	SNVS_LP_BASE_ADDR + 0x28
++#define DRY_TPCTRL7_OFFSET	SNVS_LP_BASE_ADDR + 0x2C
++#define DRY_TPCTRL8_OFFSET	SNVS_LP_BASE_ADDR + 0x30
++#define DRY_TPCTRL9_OFFSET	SNVS_LP_BASE_ADDR + 0x34
++
++#define AT5_POLYSEED		0x12345678
++
++#define MX6UL_TO_1_1
++
++#endif
+diff -Naur A/board/freescale/imx6_truxq01_som/Kconfig B/board/freescale/imx6_truxq01_som/Kconfig
+--- A/board/freescale/imx6_truxq01_som/Kconfig	1970-01-01 05:30:00.000000000 +0530
++++ B/board/freescale/imx6_truxq01_som/Kconfig	2017-06-09 11:08:40.071199198 +0530
+@@ -0,0 +1,12 @@
++if TARGET_MX6_TRUXQ01_SOM  || TARGET_MX6_TRUXQ01_SOM_MFG
++
++config SYS_BOARD
++	default "imx6_truxq01_som"
++
++config SYS_VENDOR
++	default "freescale"
++
++config SYS_CONFIG_NAME
++	default "imx6_truxq01_som"
++
++endif
+diff -Naur A/board/freescale/imx6_truxq01_som/Makefile B/board/freescale/imx6_truxq01_som/Makefile
+--- A/board/freescale/imx6_truxq01_som/Makefile	1970-01-01 05:30:00.000000000 +0530
++++ B/board/freescale/imx6_truxq01_som/Makefile	2017-06-09 11:08:40.071199198 +0530
+@@ -0,0 +1,19 @@
++# Copyright (c) 2019 Trunexa Infoways Pvt. Ltd.
++#
++# This program is free software; you can redistribute it and/or modify
++# it under the terms of the GNU General Public License version 3
++# as published by the Free Software Foundation.
++#
++# This program is distributed in the hope that it will be useful,
++# but WITHOUT ANY WARRANTY; without even the implied warranty of
++# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++# GNU General Public License for more details.
++#
++# You should have received a copy of the GNU General Public License
++# along with this program; If not, see <http://www.gnu.org/licenses/>.
++
++obj-y  := imx6_truxq01_som.o
++
++extra-$(CONFIG_USE_PLUGIN) :=  plugin.bin
++$(obj)/plugin.bin: $(obj)/plugin.o
++	$(OBJCOPY) -O binary --gap-fill 0xff $< $@
+diff -Naur A/board/freescale/imx6_truxq01_som/imx6_truxq01.cfg B/board/freescale/imx6_truxq01_som/imx6_truxq01.cfg
+--- A/board/freescale/imx6_truxq01_som/imx6_truxq01.cfg	1970-01-01 05:30:00.000000000 +0530
++++ B/board/freescale/imx6_truxq01_som/imx6_truxq01.cfg	2017-06-09 11:08:40.071199198 +0530
+@@ -0,0 +1,42 @@
++/*
++ * Copyright (c) 2019 Trunexa Infoways Pvt. Ltd.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 3
++ * as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; If not, see <http://www.gnu.org/licenses/>.
++ */
++
++#define __ASSEMBLY__
++#include <config.h>
++
++/* image version */
++
++IMAGE_VERSION 2
++
++/*
++ * Boot Device : one of
++ * spi/sd/nand/onenand, qspi/nor
++ */
++
++#ifdef CONFIG_SYS_BOOT_QSPI
++BOOT_FROM	qspi
++#elif defined(CONFIG_SYS_BOOT_EIMNOR)
++BOOT_FROM	nor
++#else
++BOOT_FROM	sd
++#endif
++
++/*PLUGIN    plugin-binary-file    IRAM_FREE_START_ADDR*/
++PLUGIN	board/freescale/imx6_truxq01_som/plugin.bin 0x00907000
++
++#ifdef CONFIG_SECURE_BOOT
++CSF CONFIG_CSF_SIZE
++#endif
+diff -Naur A/board/freescale/imx6_truxq01_som/imx6_truxq01_mfg.cfg B/board/freescale/imx6_truxq01_som/imx6_truxq01_mfg.cfg
+--- A/board/freescale/imx6_truxq01_som/imx6_truxq01_mfg.cfg	1970-01-01 05:30:00.000000000 +0530
++++ B/board/freescale/imx6_truxq01_som/imx6_truxq01_mfg.cfg	2017-06-09 11:08:40.071199198 +0530
+@@ -0,0 +1,116 @@
++/*
++ * Copyright (c) 2019 Trunexa Infoways Pvt. Ltd.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 3
++ * as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; If not, see <http://www.gnu.org/licenses/>.
++ */
++
++#define __ASSEMBLY__
++#include <config.h>
++
++/* image version */
++
++IMAGE_VERSION 2
++
++/*
++ * Boot Device : one of
++ * spi/sd/nand/onenand, qspi/nor
++ */
++
++#ifdef CONFIG_SYS_BOOT_QSPI
++BOOT_FROM	qspi
++#elif defined(CONFIG_SYS_BOOT_EIMNOR)
++BOOT_FROM	nor
++#else
++BOOT_FROM	sd
++#endif
++
++
++#ifdef CONFIG_SECURE_BOOT
++CSF CONFIG_CSF_SIZE
++#endif
++
++/*
++ * Device Configuration Data (DCD)
++ *
++ * Each entry must have the format:
++ * Addr-type           Address        Value
++ *
++ * where:
++ *	Addr-type register length (1,2 or 4 bytes)
++ *	Address	  absolute address of the register
++ *	value	  value to be stored in the register
++ */
++
++
++/* DDR type NT5CC128M16IP-DI */
++
++/* Enable all clocks */
++DATA 4 0x020c4068 0xffffffff
++DATA 4 0x020c406c 0xffffffff
++DATA 4 0x020c4070 0xffffffff
++DATA 4 0x020c4074 0xffffffff
++DATA 4 0x020c4078 0xffffffff
++DATA 4 0x020c407c 0xffffffff
++DATA 4 0x020c4080 0xffffffff
++
++DATA 4 0x020E04B4 0x000C0000
++DATA 4 0x020E04AC 0x00000000
++DATA 4 0x020E027C 0x00000030
++DATA 4 0x020E0250 0x00000030
++DATA 4 0x020E024C 0x00000030
++DATA 4 0x020E0490 0x00000030
++DATA 4 0x020E0288 0x00000030
++DATA 4 0x020E0270 0x00000000
++DATA 4 0x020E0260 0x00000030
++DATA 4 0x020E0264 0x00000030
++DATA 4 0x020E04A0 0x00000030
++DATA 4 0x020E0494 0x00020000
++DATA 4 0x020E0280 0x00000030
++DATA 4 0x020E0284 0x00000030
++DATA 4 0x020E04B0 0x00020000
++DATA 4 0x020E0498 0x00000030
++DATA 4 0x020E04A4 0x00000030
++DATA 4 0x020E0244 0x00000030
++DATA 4 0x020E0248 0x00000030
++DATA 4 0x021B0800 0xA1390003
++DATA 4 0x021B080C 0x00000000
++DATA 4 0x021B083C 0x4148014C	
++DATA 4 0x021B0848 0x4040464A
++DATA 4 0x021B0850 0x40405652
++DATA 4 0x021B081C 0x33333333
++DATA 4 0x021B0820 0x33333333
++DATA 4 0x021B082C 0xf3333333
++DATA 4 0x021B0830 0xf3333333
++DATA 4 0x021B08C0 0x00921012
++DATA 4 0x021B08b8 0x00000800
++DATA 4 0x021B0004 0x0002002D
++DATA 4 0x021B0008 0x1B333030
++DATA 4 0x021B000C 0x676B52F3
++DATA 4 0x021B0010 0xB66D0B63
++DATA 4 0x021B0014 0x01FF00DB
++DATA 4 0x021B0018 0x00211740
++DATA 4 0x021B001C 0x00008000
++DATA 4 0x021B002C 0x000026D2
++DATA 4 0x021B0030 0x006B1023
++DATA 4 0x021B0040 0x00000047
++DATA 4 0x021B0000 0x83180000
++DATA 4 0x021B001C 0x02008032
++DATA 4 0x021B001C 0x00008033
++DATA 4 0x021B001C 0x00048031
++DATA 4 0x021B001C 0x15208030
++DATA 4 0x021B001C 0x04008040
++DATA 4 0x021B0020 0x00000800
++DATA 4 0x021B0818 0x00000227
++DATA 4 0x021B0004 0x0002556D
++DATA 4 0x021B0404 0x00011006
++DATA 4 0x021B001C 0x00000000
+diff -Naur A/board/freescale/imx6_truxq01_som/imx6_truxq01_som.c B/board/freescale/imx6_truxq01_som/imx6_truxq01_som.c
+--- A/board/freescale/imx6_truxq01_som/imx6_truxq01_som.c	1970-01-01 05:30:00.000000000 +0530
++++ B/board/freescale/imx6_truxq01_som/imx6_truxq01_som.c	2017-06-09 11:08:40.071199198 +0530
+@@ -0,0 +1,815 @@
++/*
++ * Copyright (c) 2019 Trunexa Infoways Pvt. Ltd.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 3
++ * as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; If not, see <http://www.gnu.org/licenses/>.
++ */
++
++#include <asm/arch/clock.h>
++#include <asm/arch/iomux.h>
++#include <asm/arch/imx-regs.h>
++#include <asm/arch/crm_regs.h>
++#include <asm/arch/mx6-pins.h>
++#include <asm/arch/sys_proto.h>
++#include <asm/gpio.h>
++#include <asm/imx-common/iomux-v3.h>
++#include <asm/imx-common/boot_mode.h>
++#include <asm/imx-common/mxc_i2c.h>
++#include <asm/io.h>
++#include <common.h>
++#include <fsl_esdhc.h>
++#include <i2c.h>
++#include <miiphy.h>
++#include <linux/sizes.h>
++#include <mmc.h>
++#include <mxsfb.h>
++#include <netdev.h>
++#include <power/pmic.h>
++#include <power/pfuze3000_pmic.h>
++#include "../common/pfuze.h"
++#include <usb.h>
++#include <usb/ehci-fsl.h>
++#include <asm/imx-common/video.h>
++
++
++#include "imx6_truxq01_som.h"
++
++
++DECLARE_GLOBAL_DATA_PTR;
++
++#define UART_PAD_CTRL  (PAD_CTL_PKE | PAD_CTL_PUE |		\
++	PAD_CTL_PUS_100K_UP | PAD_CTL_SPEED_MED |		\
++	PAD_CTL_DSE_40ohm   | PAD_CTL_SRE_FAST  | PAD_CTL_HYS)
++
++#define USDHC_PAD_CTRL (PAD_CTL_PKE | PAD_CTL_PUE |		\
++	PAD_CTL_PUS_22K_UP  | PAD_CTL_SPEED_LOW |		\
++	PAD_CTL_DSE_80ohm   | PAD_CTL_SRE_FAST  | PAD_CTL_HYS)
++
++#define USDHC_DAT3_CD_PAD_CTRL (PAD_CTL_PKE | PAD_CTL_PUE |	\
++	PAD_CTL_PUS_100K_DOWN  | PAD_CTL_SPEED_LOW |		\
++	PAD_CTL_DSE_80ohm   | PAD_CTL_SRE_FAST  | PAD_CTL_HYS)
++
++#define I2C_PAD_CTRL    (PAD_CTL_PKE | PAD_CTL_PUE |            \
++	PAD_CTL_PUS_100K_UP | PAD_CTL_SPEED_MED |               \
++	PAD_CTL_DSE_40ohm | PAD_CTL_HYS |			\
++	PAD_CTL_ODE)
++
++#define ENET_PAD_CTRL  (PAD_CTL_PUS_100K_UP | PAD_CTL_PUE |     \
++	PAD_CTL_SPEED_HIGH   |                                  \
++	PAD_CTL_DSE_48ohm   | PAD_CTL_SRE_FAST)
++
++#define LCD_PAD_CTRL    (PAD_CTL_HYS | PAD_CTL_PUS_100K_UP | PAD_CTL_PUE | \
++	PAD_CTL_PKE | PAD_CTL_SPEED_MED | PAD_CTL_DSE_40ohm)
++
++#define MDIO_PAD_CTRL  (PAD_CTL_PUS_100K_UP | PAD_CTL_PUE |     \
++	PAD_CTL_DSE_48ohm   | PAD_CTL_SRE_FAST | PAD_CTL_ODE)
++
++#define ENET_CLK_PAD_CTRL  (PAD_CTL_DSE_40ohm   | PAD_CTL_SRE_FAST)
++
++#define ENET_RX_PAD_CTRL  (PAD_CTL_PKE | PAD_CTL_PUE |          \
++	PAD_CTL_SPEED_HIGH   | PAD_CTL_SRE_FAST)
++
++#define GPMI_PAD_CTRL0 (PAD_CTL_PKE | PAD_CTL_PUE | PAD_CTL_PUS_100K_UP)
++#define GPMI_PAD_CTRL1 (PAD_CTL_DSE_40ohm | PAD_CTL_SPEED_MED | \
++			PAD_CTL_SRE_FAST)
++#define GPMI_PAD_CTRL2 (GPMI_PAD_CTRL0 | GPMI_PAD_CTRL1)
++
++#define WEIM_NOR_PAD_CTRL (PAD_CTL_PKE | PAD_CTL_PUE | \
++		PAD_CTL_PUS_100K_UP | PAD_CTL_SPEED_MED | \
++		PAD_CTL_DSE_40ohm   | PAD_CTL_SRE_FAST)
++
++#define SPI_PAD_CTRL (PAD_CTL_HYS |				\
++	PAD_CTL_SPEED_MED |		\
++	PAD_CTL_DSE_40ohm | PAD_CTL_SRE_FAST)
++
++#define OTG_ID_PAD_CTRL (PAD_CTL_PKE | PAD_CTL_PUE |		\
++	PAD_CTL_PUS_47K_UP  | PAD_CTL_SPEED_LOW |		\
++	PAD_CTL_DSE_80ohm   | PAD_CTL_SRE_FAST  | PAD_CTL_HYS)
++
++static void lcd_power_off(void);
++#ifdef CONFIG_SYS_I2C_MXC
++#define PC MUX_PAD_CTRL(I2C_PAD_CTRL)
++/* I2C1 for PMIC and EEPROM */
++static struct i2c_pads_info i2c_pad_info1 = {
++	.scl = {
++		.i2c_mode =  MX6_PAD_UART4_TX_DATA__I2C1_SCL | PC,
++		.gpio_mode = MX6_PAD_UART4_TX_DATA__GPIO1_IO28 | PC,
++		.gp = IMX_GPIO_NR(1, 28),
++	},
++	.sda = {
++		.i2c_mode = MX6_PAD_UART4_RX_DATA__I2C1_SDA | PC,
++		.gpio_mode = MX6_PAD_UART4_RX_DATA__GPIO1_IO29 | PC,
++		.gp = IMX_GPIO_NR(1, 29),
++	},
++};
++
++#ifdef CONFIG_POWER
++#define I2C_PMIC       0
++int power_init_board(void)
++{
++		struct pmic *pfuze;
++		int ret;
++		unsigned int reg, rev_id;
++
++		ret = power_pfuze3000_init(I2C_PMIC);
++		if (ret)
++			return ret;
++
++		pfuze = pmic_get("PFUZE3000");
++		ret = pmic_probe(pfuze);
++		if (ret)
++			return ret;
++
++		pmic_reg_read(pfuze, PFUZE3000_DEVICEID, &reg);
++		pmic_reg_read(pfuze, PFUZE3000_REVID, &rev_id);
++		printf("PMIC: PFUZE3000 DEV_ID=0x%x REV_ID=0x%x\n",
++		       reg, rev_id);
++
++		/* disable Low Power Mode during standby mode */
++		pmic_reg_read(pfuze, PFUZE3000_LDOGCTL, &reg);
++		reg |= 0x1;
++		pmic_reg_write(pfuze, PFUZE3000_LDOGCTL, reg);
++
++		/* SW1B step ramp up time from 2us to 4us/25mV */
++		reg = 0x40;
++		pmic_reg_write(pfuze, PFUZE3000_SW1BCONF, reg);
++
++		/* SW1B mode to APS/PFM */
++		reg = 0xc;
++		pmic_reg_write(pfuze, PFUZE3000_SW1BMODE, reg);
++
++		/* SW1B standby voltage set to 0.975V */
++		reg = 0xb;
++		pmic_reg_write(pfuze, PFUZE3000_SW1BSTBY, reg);
++	
++	return 0;
++}
++
++#ifdef CONFIG_LDO_BYPASS_CHECK
++void ldo_mode_set(int ldo_bypass)
++{
++	unsigned int value;
++	u32 vddarm;
++
++	struct pmic *p = pmic_get("PFUZE3000");
++
++	if (!p) {
++		printf("No PMIC found!\n");
++		return;
++	}
++
++	/* switch to ldo_bypass mode */
++	if (ldo_bypass) {
++		prep_anatop_bypass();
++		/* decrease VDDARM to 1.275V */
++		pmic_reg_read(p, PFUZE3000_SW1BVOLT, &value);
++		value &= ~0x1f;
++		value |= PFUZE3000_SW1AB_SETP(1275);
++		pmic_reg_write(p, PFUZE3000_SW1BVOLT, value);
++
++		set_anatop_bypass(1);
++		vddarm = PFUZE3000_SW1AB_SETP(1175);
++
++		pmic_reg_read(p, PFUZE3000_SW1BVOLT, &value);
++		value &= ~0x1f;
++		value |= vddarm;
++		pmic_reg_write(p, PFUZE3000_SW1BVOLT, value);
++
++		finish_anatop_bypass();
++
++		printf("switch to ldo_bypass mode!\n");
++	}
++}
++#endif
++#endif
++#endif
++
++int dram_init(void)
++{
++	gd->ram_size = imx_ddr_size();
++
++	return 0;
++}
++
++static iomux_v3_cfg_t const uart1_pads[] = {
++	MX6_PAD_UART1_TX_DATA__UART1_DCE_TX | MUX_PAD_CTRL(UART_PAD_CTRL),
++	MX6_PAD_UART1_RX_DATA__UART1_DCE_RX | MUX_PAD_CTRL(UART_PAD_CTRL),
++};
++
++static iomux_v3_cfg_t const usdhc1_pads[] = {
++	MX6_PAD_SD1_CLK__USDHC1_CLK | MUX_PAD_CTRL(USDHC_PAD_CTRL),
++	MX6_PAD_SD1_CMD__USDHC1_CMD | MUX_PAD_CTRL(USDHC_PAD_CTRL),
++	MX6_PAD_SD1_DATA0__USDHC1_DATA0 | MUX_PAD_CTRL(USDHC_PAD_CTRL),
++	MX6_PAD_SD1_DATA1__USDHC1_DATA1 | MUX_PAD_CTRL(USDHC_PAD_CTRL),
++	MX6_PAD_SD1_DATA2__USDHC1_DATA2 | MUX_PAD_CTRL(USDHC_PAD_CTRL),
++	MX6_PAD_SD1_DATA3__USDHC1_DATA3 | MUX_PAD_CTRL(USDHC_PAD_CTRL),
++
++		/* CD */
++	MX6_PAD_UART1_RTS_B__GPIO1_IO19 | MUX_PAD_CTRL(NO_PAD_CTRL),
++};
++
++#if defined(CONFIG_MX6_TRUXQ01_SOM_EMMC_REWORK) 
++static iomux_v3_cfg_t const usdhc2_emmc_pads[] = {
++	MX6_PAD_NAND_RE_B__USDHC2_CLK | MUX_PAD_CTRL(USDHC_PAD_CTRL),
++	MX6_PAD_NAND_WE_B__USDHC2_CMD | MUX_PAD_CTRL(USDHC_PAD_CTRL),
++	MX6_PAD_NAND_DATA00__USDHC2_DATA0 | MUX_PAD_CTRL(USDHC_PAD_CTRL),
++	MX6_PAD_NAND_DATA01__USDHC2_DATA1 | MUX_PAD_CTRL(USDHC_PAD_CTRL),
++	MX6_PAD_NAND_DATA02__USDHC2_DATA2 | MUX_PAD_CTRL(USDHC_PAD_CTRL),
++	MX6_PAD_NAND_DATA03__USDHC2_DATA3 | MUX_PAD_CTRL(USDHC_PAD_CTRL),
++	MX6_PAD_NAND_DATA04__USDHC2_DATA4 | MUX_PAD_CTRL(USDHC_PAD_CTRL),
++	MX6_PAD_NAND_DATA05__USDHC2_DATA5 | MUX_PAD_CTRL(USDHC_PAD_CTRL),
++	MX6_PAD_NAND_DATA06__USDHC2_DATA6 | MUX_PAD_CTRL(USDHC_PAD_CTRL),
++	MX6_PAD_NAND_DATA07__USDHC2_DATA7 | MUX_PAD_CTRL(USDHC_PAD_CTRL),
++
++	/*
++	 * RST_B
++	 */
++	MX6_PAD_NAND_ALE__GPIO4_IO10 | MUX_PAD_CTRL(NO_PAD_CTRL),
++};
++#else
++static iomux_v3_cfg_t const usdhc2_pads[] = {
++	MX6_PAD_NAND_RE_B__USDHC2_CLK | MUX_PAD_CTRL(USDHC_PAD_CTRL),
++	MX6_PAD_NAND_WE_B__USDHC2_CMD | MUX_PAD_CTRL(USDHC_PAD_CTRL),
++	MX6_PAD_NAND_DATA00__USDHC2_DATA0 | MUX_PAD_CTRL(USDHC_PAD_CTRL),
++	MX6_PAD_NAND_DATA01__USDHC2_DATA1 | MUX_PAD_CTRL(USDHC_PAD_CTRL),
++	MX6_PAD_NAND_DATA02__USDHC2_DATA2 | MUX_PAD_CTRL(USDHC_PAD_CTRL),
++	MX6_PAD_NAND_DATA03__USDHC2_DATA3 | MUX_PAD_CTRL(USDHC_PAD_CTRL),
++};
++
++static iomux_v3_cfg_t const usdhc2_cd_pads[] = {
++		MX6_PAD_NAND_DATA07__GPIO4_IO09 | MUX_PAD_CTRL(USDHC_DAT3_CD_PAD_CTRL),
++};
++
++static iomux_v3_cfg_t const usdhc2_dat3_pads[] = {
++	MX6_PAD_NAND_DATA03__USDHC2_DATA3 |
++	MUX_PAD_CTRL(USDHC_DAT3_CD_PAD_CTRL),
++};
++#endif
++static iomux_v3_cfg_t const header_gpio_pads[] = {
++        MX6_PAD_LCD_DATA00__GPIO3_IO05 | MUX_PAD_CTRL(NO_PAD_CTRL),
++        MX6_PAD_LCD_DATA01__GPIO3_IO06 | MUX_PAD_CTRL(NO_PAD_CTRL),
++        MX6_PAD_LCD_DATA08__GPIO3_IO13 | MUX_PAD_CTRL(NO_PAD_CTRL),
++        MX6_PAD_LCD_DATA09__GPIO3_IO14 | MUX_PAD_CTRL(NO_PAD_CTRL),
++        MX6_PAD_LCD_DATA16__GPIO3_IO21 | MUX_PAD_CTRL(NO_PAD_CTRL),
++        MX6_PAD_LCD_DATA17__GPIO3_IO22 | MUX_PAD_CTRL(NO_PAD_CTRL),
++};
++static void setup_iomux_uart(void)
++{
++	imx_iomux_v3_setup_multiple_pads(uart1_pads, ARRAY_SIZE(uart1_pads));
++}
++
++#ifdef CONFIG_FSL_QSPI
++
++#define QSPI_PAD_CTRL1	\
++	(PAD_CTL_SRE_FAST | PAD_CTL_SPEED_MED | \
++	 PAD_CTL_PKE | PAD_CTL_PUE | PAD_CTL_PUS_47K_UP | PAD_CTL_DSE_120ohm)
++
++static iomux_v3_cfg_t const quadspi_pads[] = {
++	MX6_PAD_NAND_WP_B__QSPI_A_SCLK | MUX_PAD_CTRL(QSPI_PAD_CTRL1),
++	MX6_PAD_NAND_READY_B__QSPI_A_DATA00 | MUX_PAD_CTRL(QSPI_PAD_CTRL1),
++	MX6_PAD_NAND_CE0_B__QSPI_A_DATA01 | MUX_PAD_CTRL(QSPI_PAD_CTRL1),
++	MX6_PAD_NAND_CE1_B__QSPI_A_DATA02 | MUX_PAD_CTRL(QSPI_PAD_CTRL1),
++	MX6_PAD_NAND_CLE__QSPI_A_DATA03 | MUX_PAD_CTRL(QSPI_PAD_CTRL1),
++	MX6_PAD_NAND_DQS__QSPI_A_SS0_B | MUX_PAD_CTRL(QSPI_PAD_CTRL1),
++};
++
++static int board_qspi_init(void)
++{
++	/* Set the iomux */
++	imx_iomux_v3_setup_multiple_pads(quadspi_pads,
++					 ARRAY_SIZE(quadspi_pads));
++	/* Set the clock */
++	enable_qspi_clk(0);
++
++	return 0;
++}
++#endif
++
++#ifdef CONFIG_FSL_ESDHC
++static struct fsl_esdhc_cfg usdhc_cfg[2] = {
++	{USDHC1_BASE_ADDR, 0, 4},
++#if defined(CONFIG_MX6_TRUXQ01_SOM_EMMC_REWORK)
++	{USDHC2_BASE_ADDR, 0, 8},
++#else
++	{USDHC2_BASE_ADDR, 0, 4},
++#endif
++};
++
++#define USDHC1_CD_GPIO	IMX_GPIO_NR(1, 19)
++#define USDHC2_CD_GPIO	IMX_GPIO_NR(4, 9)
++
++int board_mmc_get_env_dev(int devno)
++{
++	if (devno == 1 && mx6_esdhc_fused(USDHC1_BASE_ADDR))
++		devno = 0;
++
++	return devno;
++}
++
++int mmc_map_to_kernel_blk(int devno)
++{
++	if (devno == 0 && mx6_esdhc_fused(USDHC1_BASE_ADDR))
++		devno = 1;
++
++	return devno;
++}
++
++int board_mmc_getcd(struct mmc *mmc)
++{
++	struct fsl_esdhc_cfg *cfg = (struct fsl_esdhc_cfg *)mmc->priv;
++	int ret = 0;
++
++	switch (cfg->esdhc_base) {
++	case USDHC1_BASE_ADDR:
++		ret = !gpio_get_value(USDHC1_CD_GPIO);
++		break;
++	case USDHC2_BASE_ADDR:
++#if defined(CONFIG_MX6_TRUXQ01_SOM_EMMC_REWORK)
++		ret = 1;
++#else
++		imx_iomux_v3_setup_multiple_pads(usdhc2_cd_pads,
++						 ARRAY_SIZE(usdhc2_cd_pads));
++		gpio_direction_input(USDHC2_CD_GPIO);
++
++		/*
++		 * Since it is the DAT3 pin, this pin is pulled to
++		 * low voltage if no card
++		 */
++		ret = gpio_get_value(USDHC2_CD_GPIO);
++
++		imx_iomux_v3_setup_multiple_pads(usdhc2_dat3_pads,
++						 ARRAY_SIZE(usdhc2_dat3_pads));
++#endif
++		break;
++	}
++
++	return ret;
++}
++
++int board_mmc_init(bd_t *bis)
++{
++#ifdef CONFIG_SPL_BUILD
++#if defined(CONFIG_MX6_TRUXQ01_SOM_EMMC_REWORK)
++	imx_iomux_v3_setup_multiple_pads(usdhc2_emmc_pads,
++					 ARRAY_SIZE(usdhc2_emmc_pads));
++#else
++	imx_iomux_v3_setup_multiple_pads(usdhc2_pads, ARRAY_SIZE(usdhc2_pads));
++#endif
++	usdhc_cfg[1].sdhc_clk = mxc_get_clock(MXC_ESDHC2_CLK);
++	return fsl_esdhc_initialize(bis, &usdhc_cfg[1]);
++#else
++	int i, ret;
++
++	/*
++	 * According to the board_mmc_init() the following map is done:
++	 * (U-Boot device node)    (Physical Port)
++	 * mmc0                    USDHC1
++	 * mmc1                    USDHC2
++	 */
++	for (i = 0; i < CONFIG_SYS_FSL_USDHC_NUM; i++) {
++		switch (i) {
++		case 0:
++			imx_iomux_v3_setup_multiple_pads(
++				usdhc1_pads, ARRAY_SIZE(usdhc1_pads));
++			gpio_direction_input(USDHC1_CD_GPIO);
++			usdhc_cfg[0].sdhc_clk = mxc_get_clock(MXC_ESDHC_CLK);
++
++			break;
++		case 1:
++#if defined(CONFIG_MX6_TRUXQ01_SOM_EMMC_REWORK)
++			imx_iomux_v3_setup_multiple_pads(
++				usdhc2_emmc_pads, ARRAY_SIZE(usdhc2_emmc_pads));
++#else
++#ifndef CONFIG_SYS_USE_NAND
++			imx_iomux_v3_setup_multiple_pads(
++				usdhc2_pads, ARRAY_SIZE(usdhc2_pads));
++#endif
++#endif
++			usdhc_cfg[1].sdhc_clk = mxc_get_clock(MXC_ESDHC2_CLK);
++			break;
++		default:
++			printf("Warning: you configured more USDHC controllers (%d) than supported by the board\n", i + 1);
++			return -EINVAL;
++			}
++
++			ret = fsl_esdhc_initialize(bis, &usdhc_cfg[i]);
++			if (ret) {
++				printf("Warning: failed to initialize mmc dev %d\n", i);
++			}
++	}
++#endif
++	return 0;
++}
++#endif
++
++#ifdef CONFIG_USB_EHCI_MX6
++#define USB_OTHERREGS_OFFSET	0x800
++#define UCTRL_PWR_POL		(1 << 9)
++
++static iomux_v3_cfg_t const usb_otg_pads[] = {
++	MX6_PAD_GPIO1_IO00__ANATOP_OTG1_ID | MUX_PAD_CTRL(OTG_ID_PAD_CTRL),
++};
++
++/* At default the 3v3 enables the MIC2026 for VBUS power */
++static void setup_usb(void)
++{
++	imx_iomux_v3_setup_multiple_pads(usb_otg_pads,
++					 ARRAY_SIZE(usb_otg_pads));
++}
++
++int board_usb_phy_mode(int port)
++{
++	if (port == 1)
++		return USB_INIT_HOST;
++	else
++		return usb_phy_mode(port);
++}
++
++int board_ehci_hcd_init(int port)
++{
++	u32 *usbnc_usb_ctrl;
++
++	if (port > 1)
++		return -EINVAL;
++
++	usbnc_usb_ctrl = (u32 *)(USB_BASE_ADDR + USB_OTHERREGS_OFFSET +
++				 port * 4);
++
++	/* Set Power polarity */
++	setbits_le32(usbnc_usb_ctrl, UCTRL_PWR_POL);
++
++	return 0;
++}
++#endif
++
++#ifdef CONFIG_NAND_MXS
++static iomux_v3_cfg_t const nand_pads[] = {
++	MX6_PAD_NAND_DATA00__RAWNAND_DATA00 | MUX_PAD_CTRL(GPMI_PAD_CTRL2),
++	MX6_PAD_NAND_DATA01__RAWNAND_DATA01 | MUX_PAD_CTRL(GPMI_PAD_CTRL2),
++	MX6_PAD_NAND_DATA02__RAWNAND_DATA02 | MUX_PAD_CTRL(GPMI_PAD_CTRL2),
++	MX6_PAD_NAND_DATA03__RAWNAND_DATA03 | MUX_PAD_CTRL(GPMI_PAD_CTRL2),
++	MX6_PAD_NAND_DATA04__RAWNAND_DATA04 | MUX_PAD_CTRL(GPMI_PAD_CTRL2),
++	MX6_PAD_NAND_DATA05__RAWNAND_DATA05 | MUX_PAD_CTRL(GPMI_PAD_CTRL2),
++	MX6_PAD_NAND_DATA06__RAWNAND_DATA06 | MUX_PAD_CTRL(GPMI_PAD_CTRL2),
++	MX6_PAD_NAND_DATA07__RAWNAND_DATA07 | MUX_PAD_CTRL(GPMI_PAD_CTRL2),
++	MX6_PAD_NAND_CLE__RAWNAND_CLE | MUX_PAD_CTRL(GPMI_PAD_CTRL2),
++	MX6_PAD_NAND_ALE__RAWNAND_ALE | MUX_PAD_CTRL(GPMI_PAD_CTRL2),
++	MX6_PAD_NAND_CE0_B__RAWNAND_CE0_B | MUX_PAD_CTRL(GPMI_PAD_CTRL2),
++	MX6_PAD_NAND_CE1_B__RAWNAND_CE1_B | MUX_PAD_CTRL(GPMI_PAD_CTRL2),
++	MX6_PAD_NAND_RE_B__RAWNAND_RE_B | MUX_PAD_CTRL(GPMI_PAD_CTRL2),
++	MX6_PAD_NAND_WE_B__RAWNAND_WE_B | MUX_PAD_CTRL(GPMI_PAD_CTRL2),
++	MX6_PAD_NAND_WP_B__RAWNAND_WP_B | MUX_PAD_CTRL(GPMI_PAD_CTRL2),
++	MX6_PAD_NAND_READY_B__RAWNAND_READY_B | MUX_PAD_CTRL(GPMI_PAD_CTRL2),
++	MX6_PAD_NAND_DQS__RAWNAND_DQS | MUX_PAD_CTRL(GPMI_PAD_CTRL2),
++};
++/*
++ * @file imx6_truxq01_som.c
++ *
++ * @brief NAND settings
++ *
++ * @ingroup NAND
++ */
++static void setup_gpmi_nand(void)
++{
++	struct mxc_ccm_reg *mxc_ccm = (struct mxc_ccm_reg *)CCM_BASE_ADDR;
++
++	/* config gpmi nand iomux */
++	imx_iomux_v3_setup_multiple_pads(nand_pads, ARRAY_SIZE(nand_pads));
++
++	setup_gpmi_io_clk((3 << MXC_CCM_CSCDR1_BCH_PODF_OFFSET) |
++			  (3 << MXC_CCM_CSCDR1_GPMI_PODF_OFFSET));
++
++	/* enable apbh clock gating */
++	setbits_le32(&mxc_ccm->CCGR0, MXC_CCM_CCGR0_APBHDMA_MASK);
++}
++#endif
++
++#ifdef CONFIG_FEC_MXC
++/*
++ * pin conflicts for fec1 and fec2, GPIO1_IO06 and GPIO1_IO07 can only
++ * be used for ENET1 or ENET2, cannot be used for both.
++ */
++static iomux_v3_cfg_t const fec1_pads[] = {
++	MX6_PAD_GPIO1_IO06__ENET1_MDIO | MUX_PAD_CTRL(MDIO_PAD_CTRL),
++	MX6_PAD_GPIO1_IO07__ENET1_MDC | MUX_PAD_CTRL(ENET_PAD_CTRL),
++	MX6_PAD_ENET1_TX_DATA0__ENET1_TDATA00 | MUX_PAD_CTRL(ENET_PAD_CTRL),
++	MX6_PAD_ENET1_TX_DATA1__ENET1_TDATA01 | MUX_PAD_CTRL(ENET_PAD_CTRL),
++	MX6_PAD_ENET1_TX_EN__ENET1_TX_EN | MUX_PAD_CTRL(ENET_PAD_CTRL),
++	MX6_PAD_ENET1_TX_CLK__ENET1_REF_CLK1 | MUX_PAD_CTRL(ENET_CLK_PAD_CTRL),
++	MX6_PAD_ENET1_RX_DATA0__ENET1_RDATA00 | MUX_PAD_CTRL(ENET_PAD_CTRL),
++	MX6_PAD_ENET1_RX_DATA1__ENET1_RDATA01 | MUX_PAD_CTRL(ENET_PAD_CTRL),
++	MX6_PAD_ENET1_RX_ER__ENET1_RX_ER | MUX_PAD_CTRL(ENET_PAD_CTRL),
++	MX6_PAD_ENET1_RX_EN__ENET1_RX_EN | MUX_PAD_CTRL(ENET_PAD_CTRL),
++	MX6_PAD_SNVS_TAMPER5__GPIO5_IO05 | MUX_PAD_CTRL(NO_PAD_CTRL),
++};
++
++static iomux_v3_cfg_t const fec2_pads[] = {
++	MX6_PAD_GPIO1_IO06__ENET2_MDIO | MUX_PAD_CTRL(MDIO_PAD_CTRL),
++	MX6_PAD_GPIO1_IO07__ENET2_MDC | MUX_PAD_CTRL(ENET_PAD_CTRL),
++
++	MX6_PAD_ENET2_TX_DATA0__ENET2_TDATA00 | MUX_PAD_CTRL(ENET_PAD_CTRL),
++	MX6_PAD_ENET2_TX_DATA1__ENET2_TDATA01 | MUX_PAD_CTRL(ENET_PAD_CTRL),
++	MX6_PAD_ENET2_TX_CLK__ENET2_REF_CLK2 | MUX_PAD_CTRL(ENET_CLK_PAD_CTRL),
++	MX6_PAD_ENET2_TX_EN__ENET2_TX_EN | MUX_PAD_CTRL(ENET_PAD_CTRL),
++
++	MX6_PAD_ENET2_RX_DATA0__ENET2_RDATA00 | MUX_PAD_CTRL(ENET_PAD_CTRL),
++	MX6_PAD_ENET2_RX_DATA1__ENET2_RDATA01 | MUX_PAD_CTRL(ENET_PAD_CTRL),
++	MX6_PAD_ENET2_RX_EN__ENET2_RX_EN | MUX_PAD_CTRL(ENET_PAD_CTRL),
++	MX6_PAD_ENET2_RX_ER__ENET2_RX_ER | MUX_PAD_CTRL(ENET_PAD_CTRL),
++	MX6_PAD_SNVS_TAMPER6__GPIO5_IO06 | MUX_PAD_CTRL(NO_PAD_CTRL),
++};
++
++static iomux_v3_cfg_t const lcd_power_pad[] = {
++	MX6_PAD_GPIO1_IO05__GPIO1_IO05 | MUX_PAD_CTRL(NO_PAD_CTRL),
++};
++
++/*
++ * @file imx6_truxq01_som.c
++ *
++ * @brief FEC settings
++ *
++ * @ingroup ENET
++ */
++static void setup_iomux_fec(int fec_id)
++{
++	if (fec_id == 0)
++		imx_iomux_v3_setup_multiple_pads(fec1_pads,
++						 ARRAY_SIZE(fec1_pads));
++	else
++		imx_iomux_v3_setup_multiple_pads(fec2_pads,
++						 ARRAY_SIZE(fec2_pads));
++}
++
++int board_eth_init(bd_t *bis)
++{
++	setup_iomux_fec(CONFIG_FEC_ENET_DEV);
++
++	return fecmxc_initialize_multi(bis, CONFIG_FEC_ENET_DEV,
++				       CONFIG_FEC_MXC_PHYADDR, IMX_FEC_BASE);
++}
++
++static int setup_fec(int fec_id)
++{
++	struct iomuxc *const iomuxc_regs = (struct iomuxc *)IOMUXC_BASE_ADDR;
++	int ret;
++
++	if (fec_id == 0) {
++		if (is_cpu_type(MXC_CPU_MX6UL))
++		{
++			if (check_module_fused(MX6_MODULE_ENET1))
++				return -1;
++		}
++
++		/*
++		 * Use 50M anatop loopback REF_CLK1 for ENET1,
++		 * clear gpr1[13], set gpr1[17].
++		 */
++		clrsetbits_le32(&iomuxc_regs->gpr[1], IOMUX_GPR1_FEC1_MASK,
++				IOMUX_GPR1_FEC1_CLOCK_MUX1_SEL_MASK);
++	} else {
++		if (is_cpu_type(MXC_CPU_MX6UL))
++		{
++			if (check_module_fused(MX6_MODULE_ENET2))
++				return -1;
++		}
++		/*
++		 * Use 50M anatop loopback REF_CLK2 for ENET2,
++		 * clear gpr1[14], set gpr1[18].
++		 */
++		clrsetbits_le32(&iomuxc_regs->gpr[1], IOMUX_GPR1_FEC2_MASK,
++				IOMUX_GPR1_FEC2_CLOCK_MUX1_SEL_MASK);
++	}
++
++	ret = enable_fec_anatop_clock(fec_id, ENET_50MHZ);
++	if (ret)
++		return ret;
++
++	enable_enet_clk(1);
++
++	return 0;
++}
++
++int board_phy_config(struct phy_device *phydev)
++{
++
++	phy_write(phydev, MDIO_DEVAD_NONE, 0x1f, 0x0190);
++
++	if (phydev->drv->config)
++		phydev->drv->config(phydev);
++
++	return 0;
++}
++#endif
++
++
++static void lcd_power_off(void)
++{
++	int i=0;
++	imx_iomux_v3_setup_multiple_pads(lcd_power_pad, ARRAY_SIZE(lcd_power_pad));
++	for (i=0;i<ARRAY_SIZE(lcd_power_pad);i++)
++	{
++		gpio_request(lcd_power_pad[i],"lcd-power");
++	}
++	gpio_direction_output(MX6_PAD_GPIO1_IO05__GPIO1_IO5 , 1);
++}
++
++int board_early_init_f(void)
++{
++	setup_iomux_uart();
++
++	lcd_power_off();
++	return 0;
++}
++
++static void header_gpio_setup(void)
++{
++        imx_iomux_v3_setup_multiple_pads(header_gpio_pads, ARRAY_SIZE(header_gpio_pads));
++}
++
++static void unused_gpio_setup(void)
++{
++        int i;
++        imx_iomux_v3_setup_multiple_pads(unused_gpio_pads_ul_ull, ARRAY_SIZE(unused_gpio_pads_ul_ull));
++        for (i=0;i<ARRAY_SIZE(unused_gpio_pads_ul_ull);i++)
++        {
++                gpio_request(unused_gpio_pads_ul_ull[i], "unusedgpio");
++                gpio_direction_input(unused_gpio_pads[i]);
++        }
++}
++
++int board_init(void)
++{
++	/* Address of boot parameters */
++	gd->bd->bi_boot_params = PHYS_SDRAM + 0x100;
++
++
++#ifdef CONFIG_SYS_I2C_MXC
++	setup_i2c(0, CONFIG_SYS_I2C_SPEED, 0x7f, &i2c_pad_info1);
++#endif
++
++#ifdef	CONFIG_FEC_MXC
++	setup_fec(CONFIG_FEC_ENET_DEV);
++#endif
++
++#ifdef CONFIG_USB_EHCI_MX6
++	setup_usb();
++#endif
++
++#ifdef CONFIG_FSL_QSPI
++	board_qspi_init();
++#endif
++
++#ifdef CONFIG_NAND_MXS
++	setup_gpmi_nand();
++#endif
++	header_gpio_setup();	
++
++        unused_gpio_setup();
++	return 0;
++}
++
++#ifdef CONFIG_CMD_BMODE
++static const struct boot_mode board_boot_modes[] = {
++	/* 4 bit bus width */
++	{"sd1", MAKE_CFGVAL(0x40, 0x20, 0x00, 0x00)},	
++	{"sd2", MAKE_CFGVAL(0x40, 0x28, 0x00, 0x00)},
++	{"qspi1", MAKE_CFGVAL(0x10, 0x00, 0x00, 0x00)},
++	{"nand", MAKE_CFGVAL(0x93, 0x18, 0x00, 0x00)},
++	{NULL,	 0},
++};
++#endif
++
++/*
++ * @file imx6_truxq01_som.c
++ *
++ * @brief print board information
++ *
++ */
++
++static void print_board_info (void)
++{
++        u32 unique_id1, unique_id2;
++
++        struct ocotp_regs *ocotp = (struct ocotp_regs *)OCOTP_BASE_ADDR;
++        struct fuse_bank *bank = &ocotp->bank[0];
++        struct fuse_bank0_regs *fuse_bank0 =
++                (struct fuse_bank0_regs *)bank->fuse_regs;
++
++        unique_id1 = readl(&fuse_bank0->uid_low);
++        unique_id2 = readl(&fuse_bank0->uid_high);
++
++        printf ("\n");
++        printf ("Board Info:\n");
++        printf ("\tBSP Version     : %s\n", BSP_VERSION);
++        printf ("\tSOM Version     : %s\n",   SOM_VERSION);
++        printf ("\tCPU Unique ID   : 0x%08x%08x \n", unique_id2, unique_id1);
++        printf ("\n");
++
++}
++
++int board_late_init(void)
++{
++#ifdef CONFIG_CMD_BMODE
++	add_board_boot_modes(board_boot_modes);
++#endif
++
++#ifdef CONFIG_ENV_IS_IN_MMC
++	board_late_mmc_env_init();
++#endif
++
++        print_board_info ();
++
++	set_wdog_reset((struct wdog_regs *)WDOG1_BASE_ADDR);
++
++	return 0;
++}
++
++int checkboard(void)
++{
++	if(is_cpu_type(MXC_CPU_MX6UL))
++		puts("Board: i.MX6UL TRUX-iMX6UL-Q01-SOM\n");
++	else
++		puts("Board: i.MX6ULL TRUX-iMX6UL-Q01-SOM\n");
++	printf("Boot Device: ");
++	switch (get_boot_device()) {
++        	case NAND_BOOT:
++                        printf("NAND\n");
++                        break;
++                case SD1_BOOT:
++                        printf("MICRO SD\n");
++                        break;
++                case SD2_BOOT:
++                        printf("MICRO SD\n");
++                        break;
++                case UNKNOWN_BOOT:
++                default:
++                        printf("UNKNOWN\n");
++	}
++               
++			return 0;
++}
++
++int dynamic_fdt_file_selection(cmd_tbl_t *cmdtp, int flag, int argc, char * const argv[])
++{   
++	//Selecting fdt files 
++	if(is_cpu_type(MXC_CPU_MX6UL))
++	{
++		setenv("fdt_file","imx6ul-truxq01-som.dtb");
++	}
++	else 
++	{
++		setenv("fdt_file","imx6ull-truxq01-som.dtb");
++	}
++	return 0;
++}
++
++void truxq01_fdt_update(void *fdt)
++{
++        int node;
++        int nodeoffset;
++        u32 addr_phandle;
++	int ret;
++
++	node = fdt_node_check_compatible(fdt, NULL, "trux,ul_truxq01_som");
++        if (node < 0)
++                return;
++
++        node = fdt_node_check_compatible(fdt, NULL, "trux,ull_truxq01_som");
++        if (node < 0)
++                return;
++
++        /* TRUXQ01: FDT: camera selection */
++        if (!strcmp("ov5640", getenv ("cam_sel"))){
++                nodeoffset = fdt_path_offset (fdt, "/soc/aips-bus@02100000/i2c@021a0000/ov5640/port/endpoint");
++                ret = fdt_create_phandle (fdt, nodeoffset);
++                if (ret < 0) {
++                        printf ("Error creating ov5640 node in FDT\n");
++                        return;
++                }
++
++                addr_phandle = fdt_get_phandle (fdt, nodeoffset);
++                do_fixup_by_path_u32(fdt, "/soc/aips-bus@02100000/csi@021c4000/port/endpoint", "remote-endpoint", addr_phandle, 0);
++                do_fixup_by_path_u32(fdt, "/soc/aips-bus@02100000/i2c@021a0000/ov7725", "status", "disabled", 0);
++        }
++	else
++	{
++	
++                do_fixup_by_path_u32(fdt, "/soc/aips-bus@02100000/i2c@021a0000/ov5640", "status", "disabled", 0);
++	}
++}
++
++U_BOOT_CMD(
++        dynamicfdt, 1, 0, dynamic_fdt_file_selection,
++       "Loading Device tree by checking Processor",
++        ""
++);
++
+diff -Naur A/board/freescale/imx6_truxq01_som/imx6_truxq01_som.h B/board/freescale/imx6_truxq01_som/imx6_truxq01_som.h
+--- A/board/freescale/imx6_truxq01_som/imx6_truxq01_som.h	1970-01-01 05:30:00.000000000 +0530
++++ B/board/freescale/imx6_truxq01_som/imx6_truxq01_som.h	2017-06-09 11:08:40.071199198 +0530
+@@ -0,0 +1,61 @@
++/*
++ * Copyright (c) 2019 Trunexa Infoways Pvt. Ltd.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2
++ * as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
++ */
++ 
++/*
++ * @file imx6_truxq01_som.h 
++ *
++ * @brief GPIO Defination for iMx6x SM SOMs
++ *
++ * @ingroup Main
++ */
++
++#include <common.h>
++#include <asm/io.h>
++#include <asm/arch/iomux.h>
++#include <asm/arch/imx6_pins_truxq01.h>
++#include <asm/arch/sys_proto.h>
++#include <asm/errno.h>
++#include <asm/gpio.h>
++#include <asm/imx-common/iomux-v3.h>
++
++#include <asm/gpio.h>
++#include <asm/arch/gpio.h>
++
++#define BSP_VERSION             "TRUX-iMX6UL-Q01-Linux4.1.15-V.1.0.0"
++#define SOM_VERSION             "TRUX-iMX6UL-Q01"
++
++/*  Unused GPIO pins */
++
++#define MX6_PAD_SNVS_TAMPER0__GPIO5_IO0        IMX_GPIO_NR(5, 0)
++#define MX6_PAD_SNVS_TAMPER3__GPIO5_IO3        IMX_GPIO_NR(5, 3)
++#define MX6_PAD_SNVS_TAMPER7__GPIO5_IO7        IMX_GPIO_NR(5, 7)
++#define MX6_PAD_SNVS_TAMPER8__GPIO5_IO8        IMX_GPIO_NR(5, 8)
++#define MX6_PAD_GPIO1_IO05__GPIO1_IO5 	       IMX_GPIO_NR(1, 5)
++
++iomux_v3_cfg_t unused_gpio_pads_ul_ull[] = {
++	MX6_PAD_SNVS_TAMPER0__GPIO5_IO00 | MUX_PAD_CTRL(NO_PAD_CTRL),
++	MX6_PAD_SNVS_TAMPER3__GPIO5_IO03 | MUX_PAD_CTRL(NO_PAD_CTRL),
++	MX6_PAD_SNVS_TAMPER7__GPIO5_IO07 | MUX_PAD_CTRL(NO_PAD_CTRL),
++	MX6_PAD_SNVS_TAMPER8__GPIO5_IO08 | MUX_PAD_CTRL(NO_PAD_CTRL),
++};
++
++int unused_gpio_pads[] = {
++	MX6_PAD_SNVS_TAMPER0__GPIO5_IO0,
++	MX6_PAD_SNVS_TAMPER3__GPIO5_IO3,
++	MX6_PAD_SNVS_TAMPER7__GPIO5_IO7,
++	MX6_PAD_SNVS_TAMPER8__GPIO5_IO8,
++};
+diff -Naur A/board/freescale/imx6_truxq01_som/plugin.S B/board/freescale/imx6_truxq01_som/plugin.S
+--- A/board/freescale/imx6_truxq01_som/plugin.S	1970-01-01 05:30:00.000000000 +0530
++++ B/board/freescale/imx6_truxq01_som/plugin.S	2017-06-09 11:08:40.071199198 +0530
+@@ -0,0 +1,265 @@
++/*
++ * Copyright (c) 2019 Trunexa Infoways Pvt. Ltd.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 3
++ * as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; If not, see <http://www.gnu.org/licenses/>.
++ */
++
++#include <config.h>
++
++/* DDR script */
++.macro imx6ul_ddr3_evk_setting
++	ldr r0, =IOMUXC_BASE_ADDR
++	ldr r1, =0x000C0000
++	str r1, [r0, #0x4B4]
++	ldr r1, =0x00000000
++	str r1, [r0, #0x4AC]
++	ldr r1, =0x00000030
++	str r1, [r0, #0x27C]
++	ldr r1, =0x00000030
++	str r1, [r0, #0x250]
++	str r1, [r0, #0x24C]
++	str r1, [r0, #0x490]
++	str r1, [r0, #0x288]
++
++	ldr r1, =0x00000000
++	str r1, [r0, #0x270]
++
++	ldr r1, =0x00000030
++	str r1, [r0, #0x260]
++	str r1, [r0, #0x264]
++	str r1, [r0, #0x4A0]
++
++	ldr r1, =0x00020000
++	str r1, [r0, #0x494]
++
++	ldr r1, =0x00000030
++	str r1, [r0, #0x280]
++	ldr r1, =0x00000030
++	str r1, [r0, #0x284]
++
++	ldr r1, =0x00020000
++	str r1, [r0, #0x4B0]
++
++	ldr r1, =0x00000030
++	str r1, [r0, #0x498]
++	str r1, [r0, #0x4A4]
++	str r1, [r0, #0x244]
++	str r1, [r0, #0x248]
++
++	ldr r0, =MMDC_P0_BASE_ADDR
++	ldr r1, =0x00008000
++	str r1, [r0, #0x1C]
++	ldr r1, =0xA1390003
++	str r1, [r0, #0x800]
++	ldr r1, =0x00000000
++	str r1, [r0, #0x80C]
++	ldr r1, =0x4148014c
++	str r1, [r0, #0x83C]
++	ldr r1, =0x4040464A
++	str r1, [r0, #0x848]
++	ldr r1, =0x40405652
++	str r1, [r0, #0x850]
++	ldr r1, =0x33333333
++	str r1, [r0, #0x81C]
++	str r1, [r0, #0x820]
++	ldr r1, =0xF3333333
++	str r1, [r0, #0x82C]
++	str r1, [r0, #0x830]
++	ldr r1, =0x00921012
++	str r1, [r0, #0x8C0]
++	ldr r1, =0x00000800
++	str r1, [r0, #0x8B8]
++	ldr r1, =0x0002002D
++	str r1, [r0, #0x004]
++	ldr r1, =0x1B333030
++	str r1, [r0, #0x008]
++	ldr r1, =0x676B52F3
++	str r1, [r0, #0x00C]
++	ldr r1, =0xB66D0B63
++	str r1, [r0, #0x010]
++	ldr r1, =0x01FF00DB
++	str r1, [r0, #0x014]
++	ldr r1, =0x00211740
++	str r1, [r0, #0x018]
++	ldr r1, =0x000026D2
++	str r1, [r0, #0x02C]
++	ldr r1, =0x006B1023
++	str r1, [r0, #0x030]
++	ldr r1, =0x00000047
++	str r1, [r0, #0x040]
++	ldr r1, =0x83180000
++	str r1, [r0, #0x000]
++	ldr r1, =0x02008032
++	str r1, [r0, #0x01C]
++	ldr r1, =0x00008033
++	str r1, [r0, #0x01C]
++	ldr r1, =0x00048031
++	str r1, [r0, #0x01C]
++	ldr r1, =0x15208030
++	str r1, [r0, #0x01C]
++	ldr r1, =0x04008040
++	str r1, [r0, #0x01C]
++	ldr r1, =0x00000800
++	str r1, [r0, #0x020]
++	ldr r1, =0x00000227
++	str r1, [r0, #0x818]
++	ldr r1, =0x0002556D
++	str r1, [r0, #0x004]
++	ldr r1, =0x00011006
++	str r1, [r0, #0x404]
++	ldr r1, =0x00000000
++	str r1, [r0, #0x01C]
++.endm
++
++.macro imx6ull_ddr3_evk_setting
++	ldr r0, =IOMUXC_BASE_ADDR
++	ldr r1, =0x000C0000
++	str r1, [r0, #0x4B4]
++	ldr r1, =0x00000000
++	str r1, [r0, #0x4AC]
++	ldr r1, =0x00000030
++	str r1, [r0, #0x27C]
++	ldr r1, =0x00000030
++	str r1, [r0, #0x250]
++	str r1, [r0, #0x24C]
++	str r1, [r0, #0x490]
++	ldr r1, =0x000C0030
++	str r1, [r0, #0x288]
++
++	ldr r1, =0x00000000
++	str r1, [r0, #0x270]
++
++	ldr r1, =0x00000030
++	str r1, [r0, #0x260]
++	str r1, [r0, #0x264]
++	str r1, [r0, #0x4A0]
++
++	ldr r1, =0x00020000
++	str r1, [r0, #0x494]
++
++	ldr r1, =0x00000030
++	str r1, [r0, #0x280]
++	ldr r1, =0x00000030
++	str r1, [r0, #0x284]
++
++	ldr r1, =0x00020000
++	str r1, [r0, #0x4B0]
++
++	ldr r1, =0x00000030
++	str r1, [r0, #0x498]
++	str r1, [r0, #0x4A4]
++	str r1, [r0, #0x244]
++	str r1, [r0, #0x248]
++
++	ldr r0, =MMDC_P0_BASE_ADDR
++	ldr r1, =0x00008000
++	str r1, [r0, #0x1C]
++	ldr r1, =0xA1390003
++	str r1, [r0, #0x800]
++	ldr r1, =0x00000000
++	str r1, [r0, #0x80C]
++	ldr r1, =0x01580158
++	str r1, [r0, #0x83C]
++	ldr r1, =0x40403038
++	str r1, [r0, #0x848]
++	ldr r1, =0x40403C34
++	str r1, [r0, #0x850]
++	ldr r1, =0x33333333
++	str r1, [r0, #0x81C]
++	str r1, [r0, #0x820]
++	ldr r1, =0xF3333333
++	str r1, [r0, #0x82C]
++	str r1, [r0, #0x830]
++	ldr r1, =0x00944009
++	str r1, [r0, #0x8C0]
++	ldr r1, =0x00000800
++	str r1, [r0, #0x8B8]
++	ldr r1, =0x0002002D
++	str r1, [r0, #0x004]
++	ldr r1, =0x1B333030
++	str r1, [r0, #0x008]
++	ldr r1, =0x3F4352F3
++	str r1, [r0, #0x00C]
++	ldr r1, =0xB66D0B63
++	str r1, [r0, #0x010]
++	ldr r1, =0x01FF00DB
++	str r1, [r0, #0x014]
++	ldr r1, =0x00211740
++	str r1, [r0, #0x018]
++	ldr r1, =0x00008000
++	str r1, [r0, #0x01C]
++	ldr r1, =0x000026D2
++	str r1, [r0, #0x02C]
++	ldr r1, =0x00431023
++	str r1, [r0, #0x030]
++	ldr r1, =0x00000047
++	str r1, [r0, #0x040]
++	ldr r1, =0x83180000
++	str r1, [r0, #0x000]
++	ldr r1, =0x00400000
++	str r1, [r0, #0x890]
++	ldr r1, =0x02008032
++	str r1, [r0, #0x01C]
++	ldr r1, =0x00008033
++	str r1, [r0, #0x01C]
++	ldr r1, =0x00048031
++	str r1, [r0, #0x01C]
++	ldr r1, =0x15208030
++	str r1, [r0, #0x01C]
++	ldr r1, =0x04008040
++	str r1, [r0, #0x01C]
++	ldr r1, =0x00007800
++	str r1, [r0, #0x020]
++	ldr r1, =0x00000227
++	str r1, [r0, #0x818]
++	ldr r1, =0x0002552D
++	str r1, [r0, #0x004]
++	ldr r1, =0x00011006
++	str r1, [r0, #0x404]
++	ldr r1, =0x00000000
++	str r1, [r0, #0x01C]
++.endm
++
++
++.macro imx6_clock_gating
++	ldr r0, =CCM_BASE_ADDR
++	ldr r1, =0xFFFFFFFF
++	str r1, [r0, #0x68]
++	str r1, [r0, #0x6C]
++	str r1, [r0, #0x70]
++	str r1, [r0, #0x74]
++	str r1, [r0, #0x78]
++	str r1, [r0, #0x7C]
++	str r1, [r0, #0x80]
++.endm
++
++.macro imx6_qos_setting
++.endm
++
++.macro imx6_ddr_setting
++	ldr r0, =ANATOP_BASE_ADDR
++        ldr r1, [r0,#0x260]
++        ldr r3,=0xff0000
++        and r1,r1,r3
++        cmp r1,#0x640000
++        beq ul_cpu
++        imx6ull_ddr3_evk_setting
++        b common_ddr
++ul_cpu:
++	imx6ul_ddr3_evk_setting
++	b common_ddr
++common_ddr:
++.endm
++
++/* include the common plugin code here */
++#include <asm/arch/mx6_plugin.S>
+diff -Naur A/common/image-fdt.c B/common/image-fdt.c
+--- A/common/image-fdt.c	2017-04-04 12:40:21.000000000 +0530
++++ B/common/image-fdt.c	2017-06-09 11:08:40.071199198 +0530
+@@ -530,6 +530,10 @@
+ 	}
+ 	fdt_fixup_ethernet(blob);
+ 
++#ifdef CONFIG_MX6_TRUXQ01
++	truxq01_fdt_update(images->ft_addr);
++#endif
++
+ 	/* Delete the old LMB reservation */
+ 	lmb_free(lmb, (phys_addr_t)(u32)(uintptr_t)blob,
+ 		 (phys_size_t)fdt_totalsize(blob));
+diff -Naur A/configs/imx6_truxq01_som_defconfig B/configs/imx6_truxq01_som_defconfig
+--- A/configs/imx6_truxq01_som_defconfig	1970-01-01 05:30:00.000000000 +0530
++++ B/configs/imx6_truxq01_som_defconfig	2017-06-09 11:08:40.071199198 +0530
+@@ -0,0 +1,7 @@
++CONFIG_ARM=y
++CONFIG_ARCH_MX6=y
++CONFIG_TARGET_MX6_TRUXQ01_SOM=y
++CONFIG_SYS_EXTRA_OPTIONS="IMX_CONFIG=board/freescale/imx6_truxq01_som/imx6_truxq01.cfg"
++CONFIG_CMD_GPIO=y
++CONFIG_CMD_DHCP=y
++CONFIG_CMD_PING=y
+diff -Naur A/configs/imx6_truxq01_som_mfg_defconfig B/configs/imx6_truxq01_som_mfg_defconfig
+--- A/configs/imx6_truxq01_som_mfg_defconfig	1970-01-01 05:30:00.000000000 +0530
++++ B/configs/imx6_truxq01_som_mfg_defconfig	2017-06-09 11:08:40.071199198 +0530
+@@ -0,0 +1,7 @@
++CONFIG_ARM=y
++CONFIG_ARCH_MX6=y
++CONFIG_TARGET_MX6_TRUXQ01_SOM_MFG=y
++CONFIG_SYS_EXTRA_OPTIONS="IMX_CONFIG=board/freescale/imx6_truxq01_som/imx6_truxq01_mfg.cfg"
++CONFIG_CMD_GPIO=y
++CONFIG_CMD_DHCP=y
++CONFIG_CMD_PING=y
+diff -Naur A/drivers/mtd/nand/mxs_nand.c B/drivers/mtd/nand/mxs_nand.c
+--- A/drivers/mtd/nand/mxs_nand.c	2017-04-04 12:40:21.000000000 +0530
++++ B/drivers/mtd/nand/mxs_nand.c	2017-06-09 11:08:40.071199198 +0530
+@@ -197,6 +197,11 @@
+ 	int meta = MXS_NAND_METADATA_SIZE;
+ 	int max_ecc_strength_supported;
+ 
++#ifdef CONFIG_MX6_TRUXQ01	
++	chip->ecc_strength_ds = mtd->ecc_strength;
++	chip->ecc_step_ds = mtd->ecc_step_size;
++#endif
++
+ 	/* Refer to Chapter 17 for i.MX6DQ, Chapter 18 for i.MX6SX */
+ 	if (is_cpu_type(MXC_CPU_MX6SX) || is_soc_type(MXC_SOC_MX7))
+ 		max_ecc_strength_supported = 62;
+diff -Naur A/drivers/mtd/spi/sf_internal.h B/drivers/mtd/spi/sf_internal.h
+--- A/drivers/mtd/spi/sf_internal.h	2017-04-04 12:40:21.000000000 +0530
++++ B/drivers/mtd/spi/sf_internal.h	2017-06-09 11:08:40.071199198 +0530
+@@ -46,6 +46,12 @@
+ 	E_FSR		= BIT(2),
+ 	SST_WR		= BIT(3),
+ 	WR_QPP		= BIT(4),
++/* TRUXQ01: SPI: Adding support for SST26VF016B
++ * Flag entry for Global block protection
++ */
++#ifdef CONFIG_MX6_TRUXQ01
++	SST_BLOCK_PROTECT = BIT(7), 
++#endif
+ };
+ 
+ enum spi_nor_option_flags {
+@@ -75,6 +81,10 @@
+ #define CMD_WRITE_STATUS		0x01
+ #define CMD_PAGE_PROGRAM		0x02
+ #define CMD_WRITE_DISABLE		0x04
++/* TRUXQ01: SPI: Adding support for SST26VF016B */
++#ifdef CONFIG_MX6_TRUXQ01
++#define CMD_UNLOCK_BPR			0x98	/* Global Block Protection Unlock */
++#endif
+ #define CMD_WRITE_ENABLE		0x06
+ #define CMD_QUAD_PAGE_PROGRAM		0x32
+ #define CMD_WRITE_EVCR			0x61
+diff -Naur A/drivers/mtd/spi/sf_params.c B/drivers/mtd/spi/sf_params.c
+--- A/drivers/mtd/spi/sf_params.c	2017-04-04 12:40:21.000000000 +0530
++++ B/drivers/mtd/spi/sf_params.c	2017-06-09 11:08:40.071199198 +0530
+@@ -100,6 +100,11 @@
+ 	{"SST25VF040B",	   0xbf258d, 0x0,	64 * 1024,     8, RD_NORM,          SECT_4K | SST_WR},
+ 	{"SST25VF080B",	   0xbf258e, 0x0,	64 * 1024,    16, RD_NORM,	    SECT_4K | SST_WR},
+ 	{"SST25VF016B",	   0xbf2541, 0x0,	64 * 1024,    32, RD_NORM,	    SECT_4K | SST_WR},
++/* TRUXQ01: SPI: Adding support for SST26VF016B,IS25LP016D */
++#ifdef CONFIG_MX6_TRUXQ01
++	{"SST26VF016B",	   0xbf2641, 0x0,	64 * 1024,    32, RD_NORM,	    SECT_4K | SST_BLOCK_PROTECT},
++	{"IS25LP016D",     0x9d6015, 0x0,	64 * 1024,    32, RD_NORM,	    SECT_4K },
++#endif
+ 	{"SST25VF032B",	   0xbf254a, 0x0,	64 * 1024,    64, RD_NORM,	    SECT_4K | SST_WR},
+ 	{"SST25VF064C",	   0xbf254b, 0x0,	64 * 1024,   128, RD_NORM,		     SECT_4K},
+ 	{"SST25WF512",	   0xbf2501, 0x0,	64 * 1024,     1, RD_NORM,	    SECT_4K | SST_WR},
+diff -Naur A/drivers/mtd/spi/spi_flash.c B/drivers/mtd/spi/spi_flash.c
+--- A/drivers/mtd/spi/spi_flash.c	2017-04-04 12:40:21.000000000 +0530
++++ B/drivers/mtd/spi/spi_flash.c	2017-06-09 11:08:40.075199198 +0530
+@@ -970,6 +970,24 @@
+ }
+ #endif /* CONFIG_IS_ENABLED(OF_CONTROL) */
+ 
++/* TRUXQ01: SPI: Adding support for SST26VF016B */
++#ifdef CONFIG_MX6_TRUXQ01
++static int sst_unlock_block_protection(struct spi_flash *flash)
++{
++        int ret;
++        ret = spi_flash_cmd_write_enable(flash);
++	if (ret) {
++		printf("Write enable failed\n");
++                return ret;
++	}
++        ret = spi_flash_cmd(flash->spi, CMD_UNLOCK_BPR, NULL, 0);
++	if (ret) 
++		printf("ULBPR failed\n");
++        return ret;
++}
++#endif
++
++
+ int spi_flash_scan(struct spi_flash *flash)
+ {
+ 	struct spi_slave *spi = flash->spi;
+@@ -1162,6 +1180,14 @@
+ 		return ret;
+ #endif
+ 
++/* TRUXQ01: SPI: Adding support for SST26VF016B */
++#ifdef CONFIG_MX6_TRUXQ01
++        if (params->flags & SST_BLOCK_PROTECT) {
++                sst_unlock_block_protection(flash);
++        }
++#endif
++
++
+ #if CONFIG_IS_ENABLED(OF_CONTROL)
+ 	ret = spi_flash_decode_fdt(gd->fdt_blob, flash);
+ 	if (ret) {
+diff -Naur A/drivers/net/fec_mxc.c B/drivers/net/fec_mxc.c
+--- A/drivers/net/fec_mxc.c	2017-04-04 12:40:21.000000000 +0530
++++ B/drivers/net/fec_mxc.c	2017-06-09 11:08:40.075199198 +0530
+@@ -1119,6 +1119,37 @@
+ 	bus = fec_get_miibus(base_mii, dev_id);
+ 	if (!bus)
+ 		return -ENOMEM;
++
++#ifdef CONFIG_MX6_TRUXQ01
++	if(CONFIG_FEC_MXC_PHYADDR == 0xFF)
++	{
++		/* TRUXQ01: Discovering Phy address*/
++		unsigned int addrs;
++		for (addrs = 0; addrs < 0x20; addrs++)
++		{
++			int id = 0;
++			int val;
++			val = fec_phy_read(bus, addrs, 0, 0x03);
++			id = val;
++			if (id == 0xFFFF)
++				continue;
++
++			val = fec_phy_read(bus, addrs, 0, 0x2);
++			if (val == 0xFFFF)
++				continue;
++
++			id |= val << 16;
++
++			printf("PHY indentify @ 0x%x = 0x%08x\n", addrs, id);
++
++			phy_id = addrs;
++
++		}
++	}
++	else
++		phy_id = CONFIG_FEC_MXC_PHYADDR;
++#endif
++
+ #ifdef CONFIG_PHYLIB
+ 	phydev = phy_find_by_mask(bus, 1 << phy_id, PHY_INTERFACE_MODE_RGMII);
+ 	if (!phydev) {
+diff -Naur A/include/configs/imx6_truxq01_som.h B/include/configs/imx6_truxq01_som.h
+--- A/include/configs/imx6_truxq01_som.h	1970-01-01 05:30:00.000000000 +0530
++++ B/include/configs/imx6_truxq01_som.h	2017-06-09 14:09:26.551288952 +0530
+@@ -0,0 +1,390 @@
++/*
++ * Copyright (c) 2019 Trunexa Infoways Pvt. Ltd.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 3
++ * as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; If not, see <http://www.gnu.org/licenses/>.
++ */
++#ifndef __MX6_TRUXQ01_SOM_CONFIG_H
++#define __MX6_TRUXQ01_SOM_CONFIG_H
++
++#define CONFIG_MX6_TRUXQ01
++
++#include <asm/arch/imx-regs.h>
++#include <linux/sizes.h>
++#include "mx6_common.h"
++#include <asm/imx-common/gpio.h>
++
++/* uncomment for PLUGIN mode support */
++ #define CONFIG_USE_PLUGIN 
++
++/* uncomment for SECURE mode support */
++/* #define CONFIG_SECURE_BOOT */
++
++/* uncomment for BEE support, needs to enable CONFIG_CMD_FUSE */
++/* #define CONFIG_CMD_BEE */
++
++#define CONFIG_CMD_TAMPER
++
++#ifdef CONFIG_SECURE_BOOT
++#ifndef CONFIG_CSF_SIZE
++#define CONFIG_CSF_SIZE 0x4000
++#endif
++#endif
++
++
++#define CONFIG_DEFAULT_FDT_FILE		"imx6ul-truxq01-som.dtb\0"
++
++#define PHYS_SDRAM_SIZE		SZ_256M
++#define CONFIG_BOOTARGS_CMA_SIZE   ""
++#undef CONFIG_LDO_BYPASS_CHECK
++
++/* SPL options */
++/* We default not support SPL
++ * #define CONFIG_SPL_LIBCOMMON_SUPPORT
++ * #define CONFIG_SPL_MMC_SUPPORT
++ * #include "imx6_spl.h"
++*/
++
++#define CONFIG_SYS_USE_NAND
++#define CONFIG_SYS_BOOT_NAND
++#define CONFIG_MTD_PARTITIONS
++#define CONFIG_CMD_MTDPARTS
++#define CONFIG_MTD_DEVICE
++#define CONFIG_CMD_NAND
++
++#define CONFIG_ENV_VARS_UBOOT_RUNTIME_CONFIG
++
++#define CONFIG_DISPLAY_CPUINFO
++#define CONFIG_DISPLAY_BOARDINFO
++
++/* Size of malloc() pool */
++#define CONFIG_SYS_MALLOC_LEN		(16 * SZ_1M)
++
++#define CONFIG_BOARD_EARLY_INIT_F
++#define CONFIG_BOARD_LATE_INIT
++
++#define CONFIG_MXC_UART
++#define CONFIG_MXC_UART_BASE		UART1_BASE
++
++/* MMC Configs */
++#ifdef CONFIG_FSL_USDHC
++#define CONFIG_SYS_FSL_ESDHC_ADDR	USDHC2_BASE_ADDR
++
++/* NAND pin conflicts with usdhc2 */
++#ifdef CONFIG_SYS_USE_NAND
++#define CONFIG_SYS_FSL_USDHC_NUM	1
++#else
++#define CONFIG_SYS_FSL_USDHC_NUM	2
++#endif
++#endif
++
++/* I2C configs */
++#define CONFIG_CMD_I2C
++#ifdef CONFIG_CMD_I2C
++#define CONFIG_SYS_I2C
++#define CONFIG_SYS_I2C_MXC
++#define CONFIG_SYS_I2C_MXC_I2C1		/* enable I2C bus 1 */
++#define CONFIG_SYS_I2C_MXC_I2C2		/* enable I2C bus 2 */
++#define CONFIG_SYS_I2C_SPEED		100000
++
++#define CONFIG_POWER
++#define CONFIG_POWER_I2C
++#define CONFIG_POWER_PFUZE3000
++#define CONFIG_POWER_PFUZE3000_I2C_ADDR  0x08
++#endif
++
++#define CONFIG_SYS_MMC_IMG_LOAD_PART	1
++
++#ifdef CONFIG_SYS_BOOT_NAND
++#define CONFIG_MFG_NAND_PARTITION "mtdparts=gpmi-nand:10m(boot),8m(kernel),1m(dtb),-(rootfs)\0 "
++#else
++#define CONFIG_MFG_NAND_PARTITION ""
++#endif
++
++#define CONFIG_MFG_ENV_SETTINGS \
++	"mfgtool_args=setenv bootargs console=${console},${baudrate} " \
++	    CONFIG_BOOTARGS_CMA_SIZE \
++		"rdinit=/linuxrc " \
++		"g_mass_storage.stall=0 g_mass_storage.removable=1 " \
++		"g_mass_storage.file=/fat g_mass_storage.ro=1 " \
++		"g_mass_storage.idVendor=0x066F g_mass_storage.idProduct=0x37FF "\
++		"g_mass_storage.iSerialNumber=\"\" "\
++		CONFIG_MFG_NAND_PARTITION \
++		"clk_ignore_unused "\
++		"\0" \
++	"initrd_addr=0x83800000\0" \
++	"initrd_high=0xffffffff\0" \
++	"bootcmd_mfg=run mfgtool_args;bootz ${loadaddr} ${initrd_addr} ${fdt_addr};\0" \
++
++#if defined(CONFIG_SYS_BOOT_NAND)
++#define CONFIG_EXTRA_ENV_SETTINGS \
++	CONFIG_MFG_ENV_SETTINGS \
++	"fdt_addr=0x83000000\0" \
++	"fdt_high=0xffffffff\0"	  \
++	"console=ttymxc0\0" \
++	"ethaddr=00:01:02:03:04:05\0" \
++	"cam_sel=ov7725\0"\
++	"bootargs=console=ttymxc0,115200 ubi.mtd=3 "  \
++		"root=ubi0:rootfs rootfstype=ubifs "		     \
++		CONFIG_BOOTARGS_CMA_SIZE \
++		CONFIG_MFG_NAND_PARTITION \
++	"bootcmd=nand read ${loadaddr} 0xA00000 0x800000;"\
++		"nand read ${fdt_addr} 0x1200000 0x100000;"\
++		"bootz ${loadaddr} - ${fdt_addr}\0"
++
++#else
++#define CONFIG_EXTRA_ENV_SETTINGS \
++	CONFIG_MFG_ENV_SETTINGS \
++	"script=boot.scr\0" \
++	"image=zImage\0" \
++	"console=ttymxc0\0" \
++	"fdt_high=0xffffffff\0" \
++	"initrd_high=0xffffffff\0" \
++	"ethaddr=00:01:02:03:04:05\0" \
++	 CONFIG_DEFAULT_FDT_FILE \
++	"fdtforce=0\0" \
++	"cam_sel=ov7725\0"\
++        "fdt_check=if test ${fdtforce} = \"0\"; then dynamicfdt;fi;\0" \
++	"fdt_addr=0x83000000\0" \
++	"boot_fdt=try\0" \
++	"ip_dyn=yes\0" \
++	"mmcdev="__stringify(CONFIG_SYS_MMC_ENV_DEV)"\0" \
++	"mmcpart=" __stringify(CONFIG_SYS_MMC_IMG_LOAD_PART) "\0" \
++	"mmcroot=" CONFIG_MMCROOT " rootwait rw\0" \
++	"mmcautodetect=yes\0" \
++	"mmcargs=setenv bootargs console=${console},${baudrate} " \
++		CONFIG_BOOTARGS_CMA_SIZE \
++		"root=${mmcroot}\0" \
++	"loadbootscript=" \
++		"fatload mmc ${mmcdev}:${mmcpart} ${loadaddr} ${script};\0" \
++	"bootscript=echo Running bootscript from mmc ...; " \
++		"source\0" \
++	"loadimage=fatload mmc ${mmcdev}:${mmcpart} ${loadaddr} ${image}\0" \
++	"loadfdt=fatload mmc ${mmcdev}:${mmcpart} ${fdt_addr} ${fdt_file}\0" \
++	"mmcboot=echo Booting from mmc ...; " \
++		"run mmcargs; " \
++		"if test ${boot_fdt} = yes || test ${boot_fdt} = try; then " \
++			"if run loadfdt; then " \
++				"bootz ${loadaddr} - ${fdt_addr}; " \
++			"else " \
++				"if test ${boot_fdt} = try; then " \
++					"bootz; " \
++				"else " \
++					"echo WARN: Cannot load the DT; " \
++				"fi; " \
++			"fi; " \
++		"else " \
++			"bootz; " \
++		"fi;\0" \
++	"netargs=setenv bootargs console=${console},${baudrate} " \
++		CONFIG_BOOTARGS_CMA_SIZE \
++		"root=/dev/nfs " \
++	"ip=dhcp nfsroot=${serverip}:${nfsroot},v3,tcp\0" \
++		"netboot=echo Booting from net ...; " \
++		"run netargs; " \
++		"if test ${ip_dyn} = yes; then " \
++			"setenv get_cmd dhcp; " \
++		"else " \
++			"setenv get_cmd tftp; " \
++		"fi; " \
++		"${get_cmd} ${image}; " \
++		"if test ${boot_fdt} = yes || test ${boot_fdt} = try; then " \
++			"if ${get_cmd} ${fdt_addr} ${fdt_file}; then " \
++				"bootz ${loadaddr} - ${fdt_addr}; " \
++			"else " \
++				"if test ${boot_fdt} = try; then " \
++					"bootz; " \
++				"else " \
++					"echo WARN: Cannot load the DT; " \
++				"fi; " \
++			"fi; " \
++		"else " \
++			"bootz; " \
++		"fi;\0" \
++		"findfdt="\
++			"if test $fdt_file = undefined; then " \
++				"if test $board_name = EVK && test $board_rev = 9X9; then " \
++					"setenv fdt_file imx6ul-9x9-evk.dtb; fi; " \
++				"if test $board_name = EVK && test $board_rev = 14X14; then " \
++					"setenv fdt_file imx6ul-14x14-evk.dtb; fi; " \
++				"if test $fdt_file = undefined; then " \
++					"echo WARNING: Could not determine dtb to use; fi; " \
++			"fi;\0" \
++
++#define CONFIG_BOOTCOMMAND \
++	   "run findfdt;" \
++	   "mmc dev ${mmcdev};" \
++	   "mmc dev ${mmcdev}; if mmc rescan; then " \
++		   "if run loadbootscript; then " \
++			   "run bootscript; " \
++		   "else " \
++			   "if run loadimage; then " \
++				   "run mmcboot; " \
++			   "else run netboot; " \
++			   "fi; " \
++		   "fi; " \
++	   "else run netboot; fi"
++#endif
++
++/* Miscellaneous configurable options */
++#define CONFIG_CMD_MEMTEST
++#define CONFIG_SYS_MEMTEST_START	0x80000000
++#define CONFIG_SYS_MEMTEST_END		(CONFIG_SYS_MEMTEST_START + 0x8000000)
++#undef CONFIG_SYS_PROMPT		
++#define CONFIG_SYS_PROMPT		"Trux-Q01> "
++
++#define CONFIG_SYS_LOAD_ADDR		CONFIG_LOADADDR
++#define CONFIG_SYS_HZ			1000
++
++#define CONFIG_STACKSIZE		SZ_128K
++
++/* Physical Memory Map */
++#define CONFIG_NR_DRAM_BANKS		1
++#define PHYS_SDRAM			MMDC0_ARB_BASE_ADDR
++
++#define CONFIG_SYS_SDRAM_BASE		PHYS_SDRAM
++#define CONFIG_SYS_INIT_RAM_ADDR	IRAM_BASE_ADDR
++#define CONFIG_SYS_INIT_RAM_SIZE	IRAM_SIZE
++
++#define CONFIG_SYS_INIT_SP_OFFSET \
++	(CONFIG_SYS_INIT_RAM_SIZE - GENERATED_GBL_DATA_SIZE)
++#define CONFIG_SYS_INIT_SP_ADDR \
++	(CONFIG_SYS_INIT_RAM_ADDR + CONFIG_SYS_INIT_SP_OFFSET)
++
++/* FLASH and environment organization */
++#define CONFIG_SYS_NO_FLASH
++
++#ifdef CONFIG_SYS_BOOT_QSPI
++#define CONFIG_FSL_QSPI
++#define CONFIG_ENV_IS_IN_SPI_FLASH
++#elif defined CONFIG_SYS_BOOT_NAND
++#define CONFIG_SYS_USE_NAND
++#define CONFIG_ENV_IS_IN_NAND
++#else
++#define CONFIG_FSL_QSPI
++#define CONFIG_ENV_IS_IN_MMC
++#endif
++
++#define CONFIG_SYS_MMC_ENV_DEV		1   /* USDHC2 */
++#define CONFIG_SYS_MMC_ENV_PART		0	/* user area */
++#define CONFIG_MMCROOT			"/dev/mmcblk1p2"  /* USDHC2 */
++
++#define CONFIG_CMD_BMODE
++
++#ifdef CONFIG_FSL_QSPI
++#define CONFIG_QSPI_BASE		QSPI0_BASE_ADDR
++#define CONFIG_QSPI_MEMMAP_BASE		QSPI0_AMBA_BASE
++
++#define CONFIG_CMD_SF
++#define CONFIG_SPI_FLASH
++#define CONFIG_SPI_FLASH_BAR
++#define CONFIG_SF_DEFAULT_BUS		0
++#define CONFIG_SF_DEFAULT_CS		0
++#define CONFIG_SF_DEFAULT_SPEED	40000000
++#define CONFIG_SF_DEFAULT_MODE		SPI_MODE_0
++#define CONFIG_SPI_FLASH_SPANSION
++#endif
++
++/* NAND stuff */
++#ifdef CONFIG_SYS_USE_NAND
++#define CONFIG_CMD_NAND
++#define CONFIG_CMD_NAND_TRIMFFS
++
++#define CONFIG_NAND_MXS
++#define CONFIG_SYS_MAX_NAND_DEVICE	1
++#define CONFIG_SYS_NAND_BASE		0x40000000
++#define CONFIG_SYS_NAND_5_ADDR_CYCLE
++#define CONFIG_SYS_NAND_ONFI_DETECTION
++
++/* DMA stuff, needed for GPMI/MXS NAND support */
++#define CONFIG_APBH_DMA
++#define CONFIG_APBH_DMA_BURST
++#define CONFIG_APBH_DMA_BURST8
++#endif
++
++#define CONFIG_ENV_SIZE			SZ_8K
++#if defined(CONFIG_ENV_IS_IN_MMC)
++#define CONFIG_ENV_OFFSET		(12 * SZ_64K)
++#elif defined(CONFIG_ENV_IS_IN_SPI_FLASH)
++#define CONFIG_ENV_OFFSET		(768 * 1024)
++#define CONFIG_ENV_SECT_SIZE		(64 * 1024)
++#define CONFIG_ENV_SPI_BUS		CONFIG_SF_DEFAULT_BUS
++#define CONFIG_ENV_SPI_CS		CONFIG_SF_DEFAULT_CS
++#define CONFIG_ENV_SPI_MODE		CONFIG_SF_DEFAULT_MODE
++#define CONFIG_ENV_SPI_MAX_HZ		CONFIG_SF_DEFAULT_SPEED
++#elif defined(CONFIG_ENV_IS_IN_NAND)
++#undef CONFIG_ENV_SIZE
++#define CONFIG_ENV_OFFSET		(6 << 20)
++#define CONFIG_ENV_SECT_SIZE		(128 << 10)
++#define CONFIG_ENV_SIZE			CONFIG_ENV_SECT_SIZE
++#endif
++
++
++/* USB Configs */
++#define CONFIG_CMD_USB
++#ifdef CONFIG_CMD_USB
++#define CONFIG_USB_EHCI
++#define CONFIG_USB_EHCI_MX6
++#define CONFIG_USB_STORAGE
++#define CONFIG_EHCI_HCD_INIT_AFTER_RESET
++#define CONFIG_USB_HOST_ETHER
++#define CONFIG_USB_ETHER_ASIX
++#define CONFIG_MXC_USB_PORTSC  (PORT_PTS_UTMI | PORT_PTS_PTW)
++#define CONFIG_MXC_USB_FLAGS   0
++#define CONFIG_USB_MAX_CONTROLLER_COUNT 2
++#endif
++
++#ifdef CONFIG_CMD_NET
++#define CONFIG_FEC_MXC
++#define CONFIG_MII
++#define CONFIG_FEC_ENET_DEV		0
++
++#define CONFIG_FEC_MXC_PHYADDR          0xFF
++#if (CONFIG_FEC_ENET_DEV == 0)
++#define IMX_FEC_BASE			ENET_BASE_ADDR
++#define CONFIG_FEC_XCV_TYPE             RMII
++#elif (CONFIG_FEC_ENET_DEV == 1)
++#define IMX_FEC_BASE			ENET2_BASE_ADDR
++#define CONFIG_FEC_XCV_TYPE		RMII
++#endif
++#define CONFIG_ETHPRIME			"FEC"
++
++#define CONFIG_PHYLIB
++#define CONFIG_PHY_MICREL
++#endif
++
++#define CONFIG_IMX_THERMAL
++
++#ifndef CONFIG_SPL_BUILD
++#undef CONFIG_VIDEO
++#ifdef CONFIG_VIDEO
++#define CONFIG_CFB_CONSOLE
++#define CONFIG_VIDEO_MXS
++#define CONFIG_VIDEO_LOGO
++#define CONFIG_VIDEO_SW_CURSOR
++#define CONFIG_VGA_AS_SINGLE_DEVICE
++#define CONFIG_SYS_CONSOLE_IS_IN_ENV
++#define CONFIG_SPLASH_SCREEN
++#define CONFIG_SPLASH_SCREEN_ALIGN
++#define CONFIG_CMD_BMP
++#define CONFIG_BMP_16BPP
++#define CONFIG_VIDEO_BMP_RLE8
++#define CONFIG_VIDEO_BMP_LOGO
++#define CONFIG_IMX_VIDEO_SKIP
++#endif
++#endif
++
++#define CONFIG_MODULE_FUSE
++#define CONFIG_OF_SYSTEM_SETUP
++
++
++#endif
+diff -Naur A/Makefile B/Makefile
+--- A/Makefile	2017-04-04 12:40:21.000000000 +0530
++++ B/Makefile	2017-06-09 11:08:40.075199198 +0530
+@@ -1429,7 +1429,7 @@
+ 	$(call cmd,rmfiles)
+ 	@find $(if $(KBUILD_EXTMOD), $(KBUILD_EXTMOD), .) $(RCS_FIND_IGNORE) \
+ 		\( -name '*.[oas]' -o -name '*.ko' -o -name '.*.cmd' \
+-		-o -name '*.ko.*' -o -name '*.su' -o -name '*.cfgtmp' \
++                -o -name '*.ko.*' -o -name '*.bin' -o -name '*.su' -o -name '*.cfgtmp' \
+ 		-o -name '.*.d' -o -name '.*.tmp' -o -name '*.mod.c' \
+ 		-o -name '*.symtypes' -o -name 'modules.order' \
+ 		-o -name modules.builtin -o -name '.tmp_*.o.*' \
